@@ -1,0 +1,72 @@
+# Mainnet configuration for dreamdex-bot.
+# Starts more conservatively than testnet for the first hour, then we can
+# bump aggressiveness once we've confirmed mainnet behavior matches testnet.
+
+bot:
+  starting_capital_usd: 50.00
+  markets_to_watch:
+    - SOMI:USDso
+    - WETH:USDso
+    - WBTC:USDso
+
+bootstrap:
+  enabled: true
+  candidate_markets:
+    - SOMI:USDso
+    - WETH:USDso
+    - WBTC:USDso
+  min_quote_balance_usd: "5.00"
+  target_quote_to_spend_usd: "3.00"
+  max_quote_fraction: "0.10"
+  reserve_quote_usd: "45.00"
+  min_base_value_usd: "1.00"
+  min_ask_depth_usd: "10.00"
+  max_spread_bps: "50.0"
+
+strategies:
+  volume_mill:
+    enabled: true
+    markets:
+      - SOMI:USDso
+      - WETH:USDso
+      - WBTC:USDso
+    cycle_interval_sec: 2.0      # Day 1 conservative; tighten to 1.0 on Day 2 if stable
+    size_per_cycle_usd: 2.00
+    size_per_cycle_usd_by_market:
+      SOMI:USDso: "2.00"
+      WETH:USDso: "4.00"
+      WBTC:USDso: "12.00"
+    max_inventory_imbalance_usd: 3.00
+    max_spread_bps: 75.0
+    min_side_depth_usd: 2.50
+    depth_usage_fraction: 0.50
+    ioc_cross_bps: 5.0
+
+  yield_maker:
+    enabled: false
+    disabled_reason: "Day 1 disabled pending paper trading of maker quotes, cancel IDs, and inventory parameters."
+    target_base_value_usd: 12.50
+    quote_size_usd: 2.00
+    min_half_spread_bps: 30      # Wider on mainnet Day 1 — easier to confirm fills are real
+    gamma: 0.5
+    k_vol: 2.0
+    requote_threshold_bps: 5
+    requote_min_interval_sec: 3.0
+    vol_window: 60
+
+risk:
+  realized_loss:
+    max_loss_usd: 10.00          # Tighter than testnet (20% vs 25%)
+  inventory_drift:
+    market: SOMI:USDso
+    max_drift_usd: 8.00
+    target_base_usd: 12.50
+    strategy: yield_maker
+  failed_tx_streak:
+    max_streak: 3                # More paranoid on mainnet
+  ws_staleness:
+    max_silence_sec: 45.0
+  open_orders_cap:
+    max_open: 6
+  max_drawdown:
+    max_drawdown_pct: 25.0

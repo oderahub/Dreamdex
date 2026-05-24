@@ -1,0 +1,716 @@
+"""Engine integration tests for the gap-fix regressions.
+
+These cover the wirings that the local audit flagged:
+  - Gap #4: cancel-all actually broadcasts (signer.send_tx is invoked)
+  - Gap #5: OpenOrdersCapRule pause is soft and auto-releases next tick
+  - Gap #9: WS reconnect triggers REST refresh of orders + balances
+  - Gap #10: KILL_SWITCH cancels + stops but does NOT auto-withdraw vault
+"""
+
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from dreamdex_bot.config import MarketSymbol
+from dreamdex_bot.core.engine import Engine
+from dreamdex_bot.interfaces.risk import (
+    AccountMetrics, RiskAction, RiskEvent, Severity,
+)
+from dreamdex_bot.interfaces.strategy import (
+    CancelIntent, FundingSource, OrderIntent, OrderType, Side, SignalAction, TradingSignal,
+)
+
+
+@pytest.fixture
+def fake_components(mock_settings):
+    """Build an Engine with all dependencies stubbed."""
+    signer = MagicMock()
+    signer.address = "0x" + "1" * 40
+    signer.send_tx = AsyncMock(return_value="0xdeadbeef")
+    signer.wait_for_receipt = AsyncMock(return_value={"status": 1, "blockNumber": 1})
+    signer.simulate_order_tx = AsyncMock(return_value=(None, None))
+    signer.w3.eth.get_balance = AsyncMock(return_value=0)
+    signer.w3.eth.call = AsyncMock(return_value=bytes(32))
+    signer.w3.eth.estimate_gas = AsyncMock(return_value=600_000)
+
+    rest = MagicMock()
+    rest.get_orderbook = AsyncMock(return_value={"bids": [], "asks": []})
+    rest.get_my_orders = AsyncMock(return_value=[])
+    rest.get_account_balances = AsyncMock(return_value={})
+    rest.prepare_cancel = AsyncMock(return_value={
+        "to": "0xpool", "data": "0xcafe", "value": 0, "gas": 200_000,
+    })
+    rest.prepare_order = AsyncMock(return_value={
+        "to": "0xpool", "data": "0xfeed", "value": 0, "gas": 500_000,
+    })
+
+    ws = MagicMock()
+    ws.last_message_ts = 0.0
+    ws.subscribe = MagicMock()
+    ws.subscribe_order = AsyncMock()
+    ws.unsubscribe_order = AsyncMock()
+    ws.on_reconnect = MagicMock()
+
+    risk = MagicMock()
+    risk.evaluate = MagicMock(return_value=[])
+
+    engine = Engine(
+        settings=mock_settings, signer=signer, rest=rest, ws=ws,
+        strategies=[], risk=risk,
+        starting_capital_usd=Decimal("50"),
+        markets_to_watch=[MarketSymbol.SOMI_USDSO],
+    )
+    return engine, signer, rest, ws, risk
+
+
+class TestKillSwitchHonesty:
+    """Gap #10: kill switch should cancel + stop, and NOT touch the vault."""
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_cancels_orders_and_stops(self, fake_components):
+        engine, signer, rest, ws, risk = fake_components
+        # Seed an open order so cancel-all has something to do
+        engine.open_orders = {"order-1": {
+            "orderId": "order-1", "market": "SOMI:USDso", "side": "buy",
+            "price": "0.5", "remainingQuantity": "10",
+        }}
+        ev = RiskEvent(
+            rule_name="realized_loss", action=RiskAction.KILL_SWITCH,
+            severity=Severity.CRITICAL, reason="loss threshold", metadata={},
+        )
+        await engine._handle_risk_events([ev])
+        # The cancel must have been broadcast (gap #4)
+        rest.prepare_cancel.assert_awaited_once_with("SOMI:USDso", "order-1")
+        signer.send_tx.assert_awaited_once()
+        # Persistent pause + stopped
+        assert engine.paused_all is True
+        assert engine._stopped is True
+        # No vault-withdraw method should have been invoked
+        for attr in dir(rest):
+            if "withdraw" in attr.lower():
+                method = getattr(rest, attr)
+                if hasattr(method, "await_count"):
+                    assert method.await_count == 0, f"vault {attr} should not be invoked on kill switch"
+
+
+class TestCancelAllBroadcasts:
+    """Gap #4: _cancel_all_orders prepares AND broadcasts each tx."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_broadcasts_each(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        engine.open_orders = {
+            "order-1": {"orderId": "order-1", "market": "SOMI:USDso", "side": "buy",
+                        "price": "0.5", "remainingQuantity": "10"},
+            "order-2": {"orderId": "order-2", "market": "SOMI:USDso", "side": "sell",
+                        "price": "0.6", "remainingQuantity": "5"},
+        }
+        await engine._cancel_all_orders()
+        assert rest.prepare_cancel.await_count == 2
+        assert signer.send_tx.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_handles_individual_failures(self, fake_components):
+        """One failed cancel shouldn't stop the rest from being attempted."""
+        engine, signer, rest, _, _ = fake_components
+        engine.open_orders = {
+            "order-1": {"orderId": "order-1", "market": "SOMI:USDso", "side": "buy",
+                        "price": "0.5", "remainingQuantity": "10"},
+            "order-2": {"orderId": "order-2", "market": "SOMI:USDso", "side": "sell",
+                        "price": "0.6", "remainingQuantity": "5"},
+        }
+        # First cancel raises, second succeeds
+        rest.prepare_cancel.side_effect = [Exception("boom"), {
+            "to": "0xpool", "data": "0xfeed", "value": 0, "gas": 200_000,
+        }]
+        await engine._cancel_all_orders()
+        # Both prep attempts were made; only the successful one was broadcast
+        assert rest.prepare_cancel.await_count == 2
+        assert signer.send_tx.await_count == 1
+
+
+class TestSoftPauseCycle:
+    """Gap #5: OpenOrdersCapRule emits PAUSE_ALL which is treated as a soft (tick-scoped)
+    pause and auto-releases the next tick when the cap is no longer hit."""
+
+    @pytest.mark.asyncio
+    async def test_open_orders_cap_is_soft_pause(self, fake_components):
+        engine, _, _, _, risk = fake_components
+        ev = RiskEvent(
+            rule_name="open_orders_cap", action=RiskAction.PAUSE_ALL,
+            severity=Severity.MEDIUM, reason="cap hit", metadata={},
+        )
+        await engine._handle_risk_events([ev])
+        # Should be a SOFT pause, not the persistent one
+        assert engine.soft_paused_all is True
+        assert engine.paused_all is False
+
+    @pytest.mark.asyncio
+    async def test_other_pause_all_is_persistent(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        ev = RiskEvent(
+            rule_name="failed_tx_streak", action=RiskAction.PAUSE_ALL,
+            severity=Severity.HIGH, reason="streak", metadata={},
+        )
+        await engine._handle_risk_events([ev])
+        # Non-allowlisted rules escalate to persistent
+        assert engine.paused_all is True
+
+    @pytest.mark.asyncio
+    async def test_soft_pause_resets_each_tick(self, fake_components):
+        """The soft_paused_all flag is reset at the start of each tick. Persistent
+        paused_all is not. This is what makes auto-release possible."""
+        engine, _, _, _, risk = fake_components
+        # Pre-set soft pause from a previous tick
+        engine.soft_paused_all = True
+        engine.paused_all = False
+        # No rules fire this tick
+        risk.evaluate.return_value = []
+        await engine._tick()
+        # Soft pause must have been cleared at tick start
+        assert engine.soft_paused_all is False
+        assert engine.paused_all is False
+
+
+class TestBalanceRiskGating:
+    """Startup balance fetch can be unavailable; balance-dependent kill rules
+    should not stop the engine until balances are confirmed."""
+
+    @pytest.mark.asyncio
+    async def test_drawdown_kill_is_gated_until_balances_loaded(self, fake_components):
+        engine, _, _, _, risk = fake_components
+        engine.balances_loaded = False
+        risk.evaluate.return_value = [RiskEvent(
+            rule_name="max_drawdown", action=RiskAction.KILL_SWITCH,
+            severity=Severity.CRITICAL, reason="unknown balances look like drawdown",
+            metadata={},
+        )]
+
+        await engine._tick()
+
+        assert engine._stopped is False
+        assert engine.paused_all is False
+
+    @pytest.mark.asyncio
+    async def test_balance_refresh_marks_confirmed_when_market_keys_present(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        rest.get_account_balances.return_value = {
+            "SOMI:USDso": {
+                "walletBase": "0", "walletQuote": "0",
+                "vaultBase": "0", "vaultQuote": "50",
+            }
+        }
+
+        await engine._refresh_balances()
+
+        assert engine.balances_loaded is True
+        state = engine.inventory_tracker.get(MarketSymbol.SOMI_USDSO)
+        assert state.vault_quote == Decimal("50")
+
+
+class TestCancelIdResolution:
+    """Strategies may track client IDs; engine resolves to server IDs when known."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_uses_server_order_id_when_mapping_exists(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        engine.client_order_to_order_id["client-1"] = "server-1"
+
+        await engine._cancel_order(CancelIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            order_id="client-1",
+            reason="requote",
+        ))
+
+        rest.prepare_cancel.assert_awaited_once_with("SOMI:USDso", "server-1")
+        signer.send_tx.assert_awaited_once()
+
+
+class TestReconnectReconciliation:
+    """Gap #9: After WS reconnect, engine refreshes open orders + balances from REST."""
+
+    @pytest.mark.asyncio
+    async def test_on_ws_reconnect_refetches_state(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        # Reset call counts (initialize() may have called them)
+        rest.get_my_orders.reset_mock()
+        rest.get_account_balances.reset_mock()
+
+        await engine._on_ws_reconnect()
+        rest.get_my_orders.assert_awaited()
+        rest.get_account_balances.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_register_ws_handlers_registers_reconnect_hook(self, fake_components):
+        engine, _, _, ws, _ = fake_components
+        engine.register_ws_handlers()
+        # Engine must register a reconnect callback so reconciliation runs after gap recovery
+        ws.on_reconnect.assert_called_once()
+        # And subscribe to the per-market public book + trade channels.
+        channel_names = [c.args[0] for c in ws.subscribe.call_args_list]
+        assert any("orderbook.SOMI:USDso" in c for c in channel_names)
+        assert "trades.SOMI:USDso" in channel_names
+
+
+class TestInventoryWiring:
+    """Gap #1/#2: fills now update inventory through InventoryTracker."""
+
+    @pytest.mark.asyncio
+    async def test_fill_event_updates_inventory(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        # Seed initial balances so the BUY has quote to spend
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("0"), wallet_quote=Decimal("100"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        await engine._on_my_fill({
+            "market": "SOMI:USDso", "side": "buy",
+            "quantity": "50", "price": "0.50",
+            "funding": "wallet", "isMaker": False,
+        })
+        state = engine.inventory_tracker.get(MarketSymbol.SOMI_USDSO)
+        # Should have actually applied the fill to balances
+        assert state.wallet_base == Decimal("50")
+        assert state.wallet_quote == Decimal("75")
+        # Position bookkeeping
+        assert state.account.position_base == Decimal("50")
+        assert state.account.avg_entry_price == Decimal("0.50")
+
+    @pytest.mark.asyncio
+    async def test_cancel_event_releases_lock(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        # Seed an open order with a quote lock
+        engine.inventory_tracker.on_order_placed(
+            MarketSymbol.SOMI_USDSO, Side.BUY,
+            qty=Decimal("100"), price=Decimal("0.50"),
+        )
+        engine.open_orders = {"o1": {
+            "orderId": "o1", "market": "SOMI:USDso", "side": "buy",
+            "price": "0.50", "remainingQuantity": "100",
+        }}
+        assert engine.inventory_tracker.get(MarketSymbol.SOMI_USDSO).quote_locked_in_orders == Decimal("50")
+
+        await engine._on_my_order_update({
+            "orderId": "o1", "market": "SOMI:USDso", "side": "buy",
+            "status": "cancelled", "remainingQuantity": "100", "price": "0.50",
+        })
+        state = engine.inventory_tracker.get(MarketSymbol.SOMI_USDSO)
+        assert state.quote_locked_in_orders == Decimal("0")
+        assert "o1" not in engine.open_orders
+
+    @pytest.mark.asyncio
+    async def test_terminal_filled_order_unsubscribes_and_releases_lock(self, fake_components):
+        engine, _, _, ws, _ = fake_components
+        engine.inventory_tracker.on_order_placed(
+            MarketSymbol.SOMI_USDSO, Side.BUY,
+            qty=Decimal("100"), price=Decimal("0.50"),
+        )
+        engine.open_orders = {"o1": {
+            "orderId": "o1", "market": "SOMI:USDso", "side": "buy",
+            "price": "0.50", "remainingQuantity": "100",
+        }}
+
+        await engine._on_my_order_update({
+            "id": "o1", "market": "SOMI:USDso", "side": "buy",
+            "status": "filled", "remainingQuantity": "0", "price": "0.50",
+        })
+
+        assert "o1" not in engine.open_orders
+        ws.unsubscribe_order.assert_awaited_once_with("o1")
+
+
+class TestBootstrapInventory:
+    @pytest.mark.asyncio
+    async def test_bootstrap_buys_base_when_wallet_is_quote_only(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        engine.bootstrap_config = {
+            "enabled": True,
+            "candidate_markets": ["SOMI:USDso"],
+            "min_quote_balance_usd": "5",
+            "target_quote_to_spend_usd": "10",
+            "max_quote_fraction": "0.40",
+            "reserve_quote_usd": "5",
+            "min_base_value_usd": "1",
+            "min_ask_depth_usd": "5",
+            "max_spread_bps": "100",
+        }
+        engine.market_state[MarketSymbol.SOMI_USDSO] = engine._book_to_state(
+            MarketSymbol.SOMI_USDSO,
+            {
+                "bids": [{"price": "0.499", "quantity": "100"}],
+                "asks": [{"price": "0.501", "quantity": "100"}],
+            },
+        )
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("0"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signer.simulate_order_tx.return_value = (True, 123)
+
+        await engine._bootstrap_initial_inventory()
+
+        rest.prepare_order.assert_awaited_once()
+        kwargs = rest.prepare_order.await_args.kwargs
+        assert kwargs["market"] == "SOMI:USDso"
+        assert kwargs["side"] == "buy"
+        assert kwargs["order_type"] == "ioc"
+        assert kwargs["funding"] == "wallet"
+        assert Decimal(kwargs["quantity"]) == Decimal("19.96")
+        signer.send_tx.assert_awaited_once()
+        signer.wait_for_receipt.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skips_when_base_already_available(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        engine.bootstrap_config = {
+            "enabled": True,
+            "candidate_markets": ["SOMI:USDso"],
+            "min_base_value_usd": "1",
+        }
+        engine.market_state[MarketSymbol.SOMI_USDSO] = engine._book_to_state(
+            MarketSymbol.SOMI_USDSO,
+            {
+                "bids": [{"price": "0.499", "quantity": "100"}],
+                "asks": [{"price": "0.501", "quantity": "100"}],
+            },
+        )
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+
+        await engine._bootstrap_initial_inventory()
+
+        rest.prepare_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skips_candidate_below_min_quantity(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        engine.bootstrap_config = {
+            "enabled": True,
+            "candidate_markets": ["WBTC:USDso"],
+            "min_quote_balance_usd": "5",
+            "target_quote_to_spend_usd": "3",
+            "max_quote_fraction": "0.10",
+            "reserve_quote_usd": "45",
+            "min_base_value_usd": "1",
+            "min_ask_depth_usd": "5",
+            "max_spread_bps": "100",
+        }
+        engine.market_state[MarketSymbol.WBTC_USDSO] = engine._book_to_state(
+            MarketSymbol.WBTC_USDSO,
+            {
+                "bids": [{"price": "75227.8", "quantity": "0.01"}],
+                "asks": [{"price": "75242.9", "quantity": "0.01"}],
+            },
+        )
+        from dreamdex_bot.core.inventory import InventoryTracker
+
+        engine.markets_to_watch = [MarketSymbol.WBTC_USDSO]
+        engine.inventory_tracker = InventoryTracker(engine.markets_to_watch)
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.WBTC_USDSO,
+            wallet_base=Decimal("0"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+
+        await engine._bootstrap_initial_inventory()
+
+        rest.prepare_order.assert_not_awaited()
+
+
+class TestPreparedOrderGas:
+    @pytest.mark.asyncio
+    async def test_place_order_estimates_gas_when_api_omits_limit(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_order.return_value = {
+            "to": "0xpool", "data": "0xfeed", "value": 0,
+        }
+        signer.simulate_order_tx.return_value = (True, 1)
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        signer.w3.eth.estimate_gas.assert_awaited_once()
+        signer.simulate_order_tx.assert_awaited_once_with(
+            to="0xpool", data="0xfeed", value=0, gas=750_000,
+        )
+        signer.send_tx.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resting_order_subscribes_to_per_order_ws_after_simulation(self, fake_components):
+        engine, signer, _, ws, _ = fake_components
+        signer.simulate_order_tx.return_value = (True, 123)
+
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.POST_ONLY,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        ws.subscribe_order.assert_awaited_once_with("123", engine._on_my_order_update)
+
+    @pytest.mark.asyncio
+    async def test_ioc_order_does_not_subscribe_to_per_order_ws(self, fake_components):
+        engine, signer, _, ws, _ = fake_components
+        signer.simulate_order_tx.return_value = (True, 123)
+
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        ws.subscribe_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_waited_order_reports_empty_receipt_logs(self, fake_components):
+        engine, signer, _, _, _ = fake_components
+        engine._report = MagicMock()
+        signer.simulate_order_tx.return_value = (True, 123)
+        signer.wait_for_receipt.return_value = {"status": 1, "blockNumber": 10, "logs": []}
+
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ), wait_for_receipt=True)
+
+        events = [call.kwargs.get("event") for call in engine._report.call_args_list]
+        assert "order_receipt_empty_logs" in events
+        confirmed = [
+            call.kwargs for call in engine._report.call_args_list
+            if call.kwargs.get("event") == "order_confirmed"
+        ]
+        assert confirmed[-1]["logs_count"] == 0
+        assert confirmed[-1]["placed"] is False
+
+    @pytest.mark.asyncio
+    async def test_place_order_does_not_broadcast_when_simulation_raises(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        signer.simulate_order_tx.side_effect = Exception("execution reverted")
+
+        result = await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        assert result is None
+        signer.send_tx.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_approval_receipt_is_not_cached(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_vault_approve = AsyncMock(return_value={
+            "to": "0xtoken", "data": "0xapprove", "value": 0, "gas": 200_000,
+        })
+        signer.wait_for_receipt.return_value = {"status": 0, "blockNumber": 10}
+
+        await engine._submit_approval(MarketSymbol.SOMI_USDSO, {
+            "token": engine.settings.quote_token(MarketSymbol.SOMI_USDSO),
+            "amount": "1000000000000000000",
+        })
+
+        assert ("SOMI:USDso", "USDso") not in engine._submitted_approvals
+
+    @pytest.mark.asyncio
+    async def test_successful_approval_receipt_is_cached(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_vault_approve = AsyncMock(return_value={
+            "to": "0xtoken", "data": "0xapprove", "value": 0, "gas": 200_000,
+        })
+        signer.wait_for_receipt.return_value = {"status": 1, "blockNumber": 10}
+
+        await engine._submit_approval(MarketSymbol.SOMI_USDSO, {
+            "token": engine.settings.quote_token(MarketSymbol.SOMI_USDSO),
+            "amount": "1000000000000000000",
+        })
+
+        assert engine._submitted_approvals[("SOMI:USDso", "USDso")] == Decimal("1000000000000000000")
+
+    @pytest.mark.asyncio
+    async def test_place_order_consumes_finite_approval_cache(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_order = AsyncMock(return_value={
+            "to": "0xpool",
+            "data": "0xfeed",
+            "value": 0,
+            "gas": 500_000,
+            "approval": {
+                "token": engine.settings.quote_token(MarketSymbol.SOMI_USDSO),
+                "amount": "1000000000000000000",
+            },
+        })
+        rest.prepare_vault_approve = AsyncMock(return_value={
+            "to": "0xtoken", "data": "0xapprove", "value": 0, "gas": 200_000,
+        })
+        signer.wait_for_receipt.return_value = {"status": 1, "blockNumber": 10}
+
+        order = OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        )
+
+        await engine._place_order("test", order)
+        assert ("SOMI:USDso", "USDso") not in engine._submitted_approvals
+
+        await engine._place_order("test", order)
+        assert rest.prepare_vault_approve.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_place_order_clears_cached_spent_token_when_prepare_omits_approval(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_order = AsyncMock(return_value={
+            "to": "0xpool",
+            "data": "0xfeed",
+            "value": 0,
+            "gas": 500_000,
+        })
+        engine._submitted_approvals[("SOMI:USDso", "USDso")] = Decimal("1000000000000000000")
+
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        assert ("SOMI:USDso", "USDso") not in engine._submitted_approvals
+
+    @pytest.mark.asyncio
+    async def test_place_order_clears_cached_base_approval_on_erc20_sell(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        rest.prepare_order = AsyncMock(return_value={
+            "to": "0xpool",
+            "data": "0xfeed",
+            "value": 0,
+            "gas": 500_000,
+        })
+        engine._submitted_approvals[("WETH:USDso", "WETH")] = Decimal("1000000000000000")
+
+        await engine._place_order("test", OrderIntent(
+            market=MarketSymbol.WETH_USDSO,
+            side=Side.SELL,
+            order_type=OrderType.IOC,
+            quantity=Decimal("0.001"),
+            price=Decimal("2000"),
+            funding=FundingSource.WALLET,
+            client_order_id="coid",
+        ))
+
+        assert ("WETH:USDso", "WETH") not in engine._submitted_approvals
+
+
+class TestAccountMetrics:
+    def test_compute_metrics_counts_shared_wallet_quote_once(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        from dreamdex_bot.core.inventory import InventoryTracker
+
+        engine.markets_to_watch = [MarketSymbol.SOMI_USDSO, MarketSymbol.WETH_USDSO]
+        engine.inventory_tracker = InventoryTracker(engine.markets_to_watch)
+        engine.market_state[MarketSymbol.SOMI_USDSO] = engine._book_to_state(
+            MarketSymbol.SOMI_USDSO,
+            {
+                "bids": [{"price": "0.49", "quantity": "1"}],
+                "asks": [{"price": "0.51", "quantity": "1"}],
+            },
+        )
+        engine.market_state[MarketSymbol.WETH_USDSO] = engine._book_to_state(
+            MarketSymbol.WETH_USDSO,
+            {
+                "bids": [{"price": "1999", "quantity": "1"}],
+                "asks": [{"price": "2001", "quantity": "1"}],
+            },
+        )
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.WETH_USDSO,
+            wallet_base=Decimal("0"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        inv_view = engine.inventory_tracker.to_strategy_view({
+            MarketSymbol.SOMI_USDSO: Decimal("0.50"),
+            MarketSymbol.WETH_USDSO: Decimal("2000"),
+        })
+
+        metrics = engine._compute_metrics(inv_view)
+
+        assert metrics.total_value_usd == Decimal("55.00")
+
+
+class TestTickBalanceReservation:
+    def test_shared_quote_token_is_reserved_across_markets(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        from dreamdex_bot.core.inventory import InventoryTracker
+
+        engine.markets_to_watch = [MarketSymbol.SOMI_USDSO, MarketSymbol.WETH_USDSO]
+        engine.inventory_tracker = InventoryTracker(engine.markets_to_watch)
+        for market in engine.markets_to_watch:
+            engine.inventory_tracker.set_initial_balances(
+                market,
+                wallet_base=Decimal("0"), wallet_quote=Decimal("10"),
+                vault_base=Decimal("0"), vault_quote=Decimal("0"),
+            )
+
+        reserved_quote: dict[str, Decimal] = {}
+        reserved_base: dict[str, Decimal] = {}
+        first = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("10"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="first",
+        ))
+        second = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.WETH_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("0.01"),
+            price=Decimal("600"),
+            funding=FundingSource.WALLET,
+            client_order_id="second",
+        ))
+
+        assert engine._reserve_tick_balance(first, reserved_quote, reserved_base) is True
+        assert engine._reserve_tick_balance(second, reserved_quote, reserved_base) is False

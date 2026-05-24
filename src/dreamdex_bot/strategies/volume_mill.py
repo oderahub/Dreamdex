@@ -1,0 +1,271 @@
+"""
+Volume Mill — wallet-funded IOC ping-pong for max volume on the leaderboard.
+
+Default market is USDC.e:USDso on mainnet (pegged USDC.e ≈ $1 ≈ USDso) which
+keeps inventory risk near zero between cycles. On testnet USDC.e:USDso doesn't
+exist, so for shakedown the market is configurable — typically SOMI:USDso with
+a smaller cycle size and an inventory cap.
+
+Fix for gap #2: the strategy is now resilient to startup-zero inventory.
+If `free_quote` looks zero (no balance fetched yet), the strategy logs a
+warning once and returns no-op signals instead of being permanently stuck.
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from decimal import Decimal
+from typing import Any
+
+from dreamdex_bot.config import MARKETS, MarketSymbol
+from dreamdex_bot.interfaces.strategy import (
+    FundingSource, MarketState, OrderIntent, OrderType, OwnInventory,
+    Side, SignalAction, TradingSignal, TradingStrategy,
+)
+from dreamdex_bot.utils.logger import get_logger
+from dreamdex_bot.utils.markets import ensure_min_quantity, round_to_lot, round_to_tick
+
+
+log = get_logger(__name__)
+
+
+class VolumeMill(TradingStrategy):
+    """Wallet-funded IOC ping-pong volume generator."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        # Market is configurable — default is the mainnet preferred pair.
+        market_str = config.get("market", "USDC.e:USDso")
+        self.market = MarketSymbol(market_str)
+        super().__init__(name=f"volume_mill:{self.market.value}", config=config)
+
+        self.cycle_interval_sec = float(config.get("cycle_interval_sec", 2.0))
+        size_by_market = config.get("size_per_cycle_usd_by_market", {})
+        self.size_per_cycle_usd = Decimal(str(
+            size_by_market.get(self.market.value, config.get("size_per_cycle_usd", "20.00"))
+        ))
+        self.max_inventory_imbalance = Decimal(str(config.get("max_inventory_imbalance", "0.50")))
+        self.max_inventory_imbalance_usd = Decimal(
+            str(config.get("max_inventory_imbalance_usd", "0"))
+        )
+        self.max_spread_bps = Decimal(str(config.get("max_spread_bps", "100")))
+        self.min_side_depth_usd = Decimal(str(config.get("min_side_depth_usd", "1.00")))
+        self.depth_usage_fraction = Decimal(str(config.get("depth_usage_fraction", "0.50")))
+        self.ioc_cross_bps = Decimal(str(config.get("ioc_cross_bps", "5.0")))
+
+        self._last_cycle_ts: float = 0
+        self._last_action: Side | None = None
+        self._warned_no_balance: bool = False
+        self.last_skip_reason: str | None = None
+
+    async def generate_signals(
+        self,
+        market_state: dict[MarketSymbol, MarketState],
+        inventory: dict[MarketSymbol, OwnInventory],
+    ) -> list[TradingSignal]:
+        if time.time() - self._last_cycle_ts < self.cycle_interval_sec:
+            return []
+
+        ms = market_state.get(self.market)
+        inv = inventory.get(self.market)
+        if ms is None or inv is None:
+            return []
+        if ms.best_bid is None or ms.best_ask is None:
+            self._skip("one_sided_or_empty_book", market=self.market.value)
+            return []
+        if not self._book_is_tradeable(ms):
+            return []
+
+        # Wallet-funded IOC pulls from total balance (wallet, not vault).
+        # If balance is zero, we can't trade — warn once and idle until funded.
+        free_quote = inv.quote_balance - inv.quote_locked_in_orders
+        if free_quote <= 0 and inv.base_balance <= 0:
+            if not self._warned_no_balance:
+                log.warning("volume_mill.no_balance",
+                            market=self.market.value,
+                            wallet_quote=str(inv.quote_balance),
+                            wallet_base=str(inv.base_balance),
+                            note="Fund the wallet (or wait for inventory refresh) to begin trading.")
+                self._warned_no_balance = True
+            return []
+        # Once we see balance, allow the warning to reset for future zero-states
+        if free_quote > 0 or inv.base_balance > 0:
+            self._warned_no_balance = False
+
+        # If we hold base above the imbalance threshold, sell to flatten.
+        max_base_units = self.max_inventory_imbalance
+        if self.max_inventory_imbalance_usd > 0:
+            max_base_units = self.max_inventory_imbalance_usd / ms.best_bid
+        if inv.base_balance > max_base_units:
+            qty = round_to_lot(inv.base_balance, self.market, direction="down")
+            qty = self._cap_qty_to_depth(qty, ms.best_bid, ms.bid_depth_usd)
+            qty_checked = ensure_min_quantity(qty, self.market)
+            if qty_checked is None or qty_checked <= 0:
+                self._skip("sell_qty_too_small_after_depth_cap", market=self.market.value)
+                return []
+            self._last_cycle_ts = time.time()
+            self._last_action = Side.SELL
+            return [self._sell_signal(qty_checked, self._sell_cross_price(ms.best_bid))]
+
+        # If a sell was rejected or failed simulation, we may still hold the
+        # prior buy while quote is too small to start another cycle. Keep
+        # working out of base instead of getting stuck in buy-size skips.
+        if self._last_action == Side.SELL and inv.base_balance > 0:
+            sell = self._sell_all_signal(ms, inv.base_balance)
+            if sell:
+                return sell
+
+        min_buy_notional = MARKETS[self.market].min_quantity * ms.best_ask
+        if inv.base_balance > 0 and free_quote < min_buy_notional:
+            sell = self._sell_all_signal(ms, inv.base_balance)
+            if sell:
+                return sell
+
+        # Otherwise ping-pong: if last action was BUY, sell remaining base.
+        # Otherwise (or if nothing held) buy fresh.
+        if self._last_action == Side.BUY and inv.base_balance > 0:
+            sell = self._sell_all_signal(ms, inv.base_balance)
+            if sell:
+                return sell
+            # Otherwise buy didn't actually fill — try buying again
+        return self._buy_cycle(ms, free_quote)
+
+    def _buy_cycle(self, ms: MarketState, free_quote: Decimal) -> list[TradingSignal]:
+        assert ms.best_ask is not None
+        usable_ask_depth = ms.ask_depth_usd * self.depth_usage_fraction
+        target_usd = min(self.size_per_cycle_usd, free_quote * Decimal("0.95"), usable_ask_depth)
+        if target_usd <= 0:
+            self._skip(
+                "buy_target_zero_after_depth_cap",
+                market=self.market.value,
+                ask_depth_usd=str(ms.ask_depth_usd),
+                free_quote=str(free_quote),
+            )
+            return []
+        qty_base = target_usd / ms.best_ask
+        qty_base = round_to_lot(qty_base, self.market, direction="down")
+        qty_checked = ensure_min_quantity(qty_base, self.market)
+        if qty_checked is None or qty_checked <= 0:
+            log.debug("volume_mill.qty_too_small",
+                      target_usd=str(target_usd), min_qty=str(MARKETS[self.market].min_quantity))
+            self._skip(
+                "buy_qty_too_small",
+                market=self.market.value,
+                target_usd=str(target_usd),
+                min_qty=str(MARKETS[self.market].min_quantity),
+            )
+            return []
+        self._last_cycle_ts = time.time()
+        self._last_action = Side.BUY
+        return [self._buy_signal(qty_checked, self._buy_cross_price(ms.best_ask))]
+
+    def _buy_signal(self, qty: Decimal, price: Decimal) -> TradingSignal:
+        return TradingSignal(
+            action=SignalAction.PLACE,
+            order=OrderIntent(
+                market=self.market,
+                side=Side.BUY,
+                order_type=OrderType.IOC,
+                quantity=qty,
+                price=price,
+                funding=FundingSource.WALLET,
+                client_order_id=f"vm_buy_{uuid.uuid4().hex[:8]}",
+                reason="volume_mill cycle buy",
+            ),
+        )
+
+    def _book_is_tradeable(self, ms: MarketState) -> bool:
+        spread_bps = self._spread_bps(ms)
+        if spread_bps is None:
+            self._skip("spread_unavailable", market=self.market.value)
+            return False
+        if spread_bps > self.max_spread_bps:
+            self._skip(
+                "spread_too_wide",
+                market=self.market.value,
+                spread_bps=str(spread_bps),
+                max_spread_bps=str(self.max_spread_bps),
+            )
+            return False
+        if ms.bid_depth_usd < self.min_side_depth_usd:
+            self._skip(
+                "bid_depth_too_thin",
+                market=self.market.value,
+                bid_depth_usd=str(ms.bid_depth_usd),
+                min_side_depth_usd=str(self.min_side_depth_usd),
+            )
+            return False
+        if ms.ask_depth_usd < self.min_side_depth_usd:
+            self._skip(
+                "ask_depth_too_thin",
+                market=self.market.value,
+                ask_depth_usd=str(ms.ask_depth_usd),
+                min_side_depth_usd=str(self.min_side_depth_usd),
+            )
+            return False
+        self.last_skip_reason = None
+        return True
+
+    def _spread_bps(self, ms: MarketState) -> Decimal | None:
+        if ms.best_bid is None or ms.best_ask is None:
+            return None
+        mid = (ms.best_bid + ms.best_ask) / 2
+        if mid <= 0:
+            return None
+        return (ms.best_ask - ms.best_bid) / mid * Decimal("10000")
+
+    def _cap_qty_to_depth(self, qty: Decimal, price: Decimal, side_depth_usd: Decimal) -> Decimal:
+        if price <= 0:
+            return Decimal(0)
+        depth_qty = side_depth_usd * self.depth_usage_fraction / price
+        return round_to_lot(min(qty, depth_qty), self.market, direction="down")
+
+    def _skip(self, reason: str, **fields: Any) -> None:
+        self.last_skip_reason = reason
+        log.info("volume_mill.skip", reason=reason, **fields)
+
+    def _buy_cross_price(self, best_ask: Decimal) -> Decimal:
+        multiplier = Decimal("1") + self.ioc_cross_bps / Decimal("10000")
+        return round_to_tick(best_ask * multiplier, self.market, direction="up")
+
+    def _sell_cross_price(self, best_bid: Decimal) -> Decimal:
+        multiplier = Decimal("1") - self.ioc_cross_bps / Decimal("10000")
+        return round_to_tick(best_bid * multiplier, self.market, direction="down")
+
+    def _sell_all_signal(self, ms: MarketState, base_balance: Decimal) -> list[TradingSignal]:
+        assert ms.best_bid is not None
+        qty = round_to_lot(base_balance, self.market, direction="down")
+        qty = self._cap_qty_to_depth(qty, ms.best_bid, ms.bid_depth_usd)
+        qty_checked = ensure_min_quantity(qty, self.market)
+        if qty_checked and qty_checked > 0:
+            self._last_cycle_ts = time.time()
+            self._last_action = Side.SELL
+            return [self._sell_signal(qty_checked, self._sell_cross_price(ms.best_bid))]
+        self._skip("sell_qty_too_small_after_depth_cap", market=self.market.value)
+        return []
+
+    def _sell_signal(self, qty: Decimal, price: Decimal) -> TradingSignal:
+        return TradingSignal(
+            action=SignalAction.PLACE,
+            order=OrderIntent(
+                market=self.market,
+                side=Side.SELL,
+                order_type=OrderType.IOC,
+                quantity=qty,
+                price=price,
+                funding=FundingSource.WALLET,
+                client_order_id=f"vm_sell_{uuid.uuid4().hex[:8]}",
+                reason="volume_mill cycle sell",
+            ),
+        )
+
+    async def on_fill(self, fill_event: dict[str, Any]) -> None:
+        log.info("volume_mill.fill",
+                 side=fill_event.get("side"),
+                 qty=fill_event.get("quantity"),
+                 price=fill_event.get("price"))
+
+    async def on_reject(self, order_id: str, reason: str) -> None:
+        log.warning("volume_mill.rejected", order_id=order_id, reason=reason)
+        # Back off one cycle on reject
+        self._last_cycle_ts = time.time()
