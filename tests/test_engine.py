@@ -388,6 +388,62 @@ class TestBootstrapInventory:
         rest.prepare_order.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_bootstrap_continues_after_native_gas_candidate(self, fake_components):
+        """Native SOMI gas should not prevent bootstrapping another quote-only market."""
+        from dreamdex_bot.core.inventory import InventoryTracker
+
+        engine, signer, rest, _, _ = fake_components
+        engine.markets_to_watch = [MarketSymbol.SOMI_USDSO, MarketSymbol.WETH_USDSO]
+        engine.inventory_tracker = InventoryTracker(engine.markets_to_watch)
+        engine.bootstrap_config = {
+            "enabled": True,
+            "candidate_markets": ["SOMI:USDso", "WETH:USDso"],
+            "min_quote_balance_usd": "5",
+            "target_quote_to_spend_usd": "10",
+            "max_quote_fraction": "0.40",
+            "reserve_quote_usd": "5",
+            "min_base_value_usd": "1",
+            "min_ask_depth_usd": "5",
+            "max_spread_bps": "100",
+        }
+        engine.market_state[MarketSymbol.SOMI_USDSO] = engine._book_to_state(
+            MarketSymbol.SOMI_USDSO,
+            {
+                "bids": [{"price": "0.1709", "quantity": "1000"}],
+                "asks": [{"price": "0.1711", "quantity": "1000"}],
+            },
+        )
+        engine.market_state[MarketSymbol.WETH_USDSO] = engine._book_to_state(
+            MarketSymbol.WETH_USDSO,
+            {
+                "bids": [{"price": "2118.00", "quantity": "1"}],
+                "asks": [{"price": "2118.50", "quantity": "1"}],
+            },
+        )
+        # SOMI native balance represents gas/base already available, while WETH
+        # is quote-only. Bootstrap should skip SOMI and still buy WETH.
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.WETH_USDSO,
+            wallet_base=Decimal("0"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signer.simulate_order_tx.return_value = (True, 123)
+
+        await engine._bootstrap_initial_inventory()
+
+        rest.prepare_order.assert_awaited_once()
+        kwargs = rest.prepare_order.await_args.kwargs
+        assert kwargs["market"] == "WETH:USDso"
+        assert kwargs["side"] == "buy"
+        assert kwargs["order_type"] == "ioc"
+        assert Decimal(kwargs["quantity"]) == Decimal("0.0047")
+
+    @pytest.mark.asyncio
     async def test_bootstrap_skips_candidate_below_min_quantity(self, fake_components):
         engine, _, rest, _, _ = fake_components
         engine.bootstrap_config = {

@@ -52,6 +52,13 @@ class VolumeMill(TradingStrategy):
         self.min_side_depth_usd = Decimal(str(config.get("min_side_depth_usd", "1.00")))
         self.depth_usage_fraction = Decimal(str(config.get("depth_usage_fraction", "0.50")))
         self.ioc_cross_bps = Decimal(str(config.get("ioc_cross_bps", "5.0")))
+        reserve_by_market = config.get("native_base_reserve_by_market", {})
+        self.native_base_reserve = Decimal(str(
+            reserve_by_market.get(
+                self.market.value,
+                config.get("native_base_reserve", "0"),
+            )
+        ))
 
         self._last_cycle_ts: float = 0
         self._last_action: Side | None = None
@@ -79,25 +86,27 @@ class VolumeMill(TradingStrategy):
         # Wallet-funded IOC pulls from total balance (wallet, not vault).
         # If balance is zero, we can't trade — warn once and idle until funded.
         free_quote = inv.quote_balance - inv.quote_locked_in_orders
-        if free_quote <= 0 and inv.base_balance <= 0:
+        tradable_base = self._tradable_base_balance(inv)
+        if free_quote <= 0 and tradable_base <= 0:
             if not self._warned_no_balance:
                 log.warning("volume_mill.no_balance",
                             market=self.market.value,
                             wallet_quote=str(inv.quote_balance),
                             wallet_base=str(inv.base_balance),
+                            tradable_base=str(tradable_base),
                             note="Fund the wallet (or wait for inventory refresh) to begin trading.")
                 self._warned_no_balance = True
             return []
         # Once we see balance, allow the warning to reset for future zero-states
-        if free_quote > 0 or inv.base_balance > 0:
+        if free_quote > 0 or tradable_base > 0:
             self._warned_no_balance = False
 
         # If we hold base above the imbalance threshold, sell to flatten.
         max_base_units = self.max_inventory_imbalance
         if self.max_inventory_imbalance_usd > 0:
             max_base_units = self.max_inventory_imbalance_usd / ms.best_bid
-        if inv.base_balance > max_base_units:
-            qty = round_to_lot(inv.base_balance, self.market, direction="down")
+        if tradable_base > max_base_units:
+            qty = round_to_lot(tradable_base, self.market, direction="down")
             qty = self._cap_qty_to_depth(qty, ms.best_bid, ms.bid_depth_usd)
             qty_checked = ensure_min_quantity(qty, self.market)
             if qty_checked is None or qty_checked <= 0:
@@ -110,21 +119,21 @@ class VolumeMill(TradingStrategy):
         # If a sell was rejected or failed simulation, we may still hold the
         # prior buy while quote is too small to start another cycle. Keep
         # working out of base instead of getting stuck in buy-size skips.
-        if self._last_action == Side.SELL and inv.base_balance > 0:
-            sell = self._sell_all_signal(ms, inv.base_balance)
+        if self._last_action == Side.SELL and tradable_base > 0:
+            sell = self._sell_all_signal(ms, tradable_base)
             if sell:
                 return sell
 
         min_buy_notional = MARKETS[self.market].min_quantity * ms.best_ask
-        if inv.base_balance > 0 and free_quote < min_buy_notional:
-            sell = self._sell_all_signal(ms, inv.base_balance)
+        if tradable_base > 0 and free_quote < min_buy_notional:
+            sell = self._sell_all_signal(ms, tradable_base)
             if sell:
                 return sell
 
         # Otherwise ping-pong: if last action was BUY, sell remaining base.
         # Otherwise (or if nothing held) buy fresh.
-        if self._last_action == Side.BUY and inv.base_balance > 0:
-            sell = self._sell_all_signal(ms, inv.base_balance)
+        if self._last_action == Side.BUY and tradable_base > 0:
+            sell = self._sell_all_signal(ms, tradable_base)
             if sell:
                 return sell
             # Otherwise buy didn't actually fill — try buying again
@@ -219,6 +228,12 @@ class VolumeMill(TradingStrategy):
             return Decimal(0)
         depth_qty = side_depth_usd * self.depth_usage_fraction / price
         return round_to_lot(min(qty, depth_qty), self.market, direction="down")
+
+    def _tradable_base_balance(self, inv: OwnInventory) -> Decimal:
+        if not MARKETS[self.market].is_base_native:
+            return inv.base_balance
+        reserved = min(inv.base_balance, self.native_base_reserve)
+        return max(Decimal("0"), inv.base_balance - reserved)
 
     def _skip(self, reason: str, **fields: Any) -> None:
         self.last_skip_reason = reason

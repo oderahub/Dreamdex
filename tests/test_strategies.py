@@ -99,6 +99,41 @@ class TestVolumeMill:
         assert signals[0].order.price == Decimal("0.4997")  # crosses below best bid
 
     @pytest.mark.asyncio
+    async def test_does_not_sell_reserved_native_base(self):
+        strat = VolumeMill({
+            "market": "SOMI:USDso",
+            "size_per_cycle_usd": "20.00",
+            "native_base_reserve_by_market": {"SOMI:USDso": "10"},
+        })
+        ms = make_market_state(MarketSymbol.SOMI_USDSO, "0.500", "0.501")
+        inv = make_inventory(MarketSymbol.SOMI_USDSO, quote="0", base="10")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.SOMI_USDSO: ms}, {MarketSymbol.SOMI_USDSO: inv},
+        )
+
+        assert signals == []
+
+    @pytest.mark.asyncio
+    async def test_sells_only_native_base_above_reserve(self):
+        strat = VolumeMill({
+            "market": "SOMI:USDso",
+            "size_per_cycle_usd": "20.00",
+            "max_inventory_imbalance": "1",
+            "native_base_reserve_by_market": {"SOMI:USDso": "10"},
+        })
+        ms = make_market_state(MarketSymbol.SOMI_USDSO, "0.500", "0.501")
+        inv = make_inventory(MarketSymbol.SOMI_USDSO, quote="0", base="40")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.SOMI_USDSO: ms}, {MarketSymbol.SOMI_USDSO: inv},
+        )
+
+        assert len(signals) == 1
+        assert signals[0].order.side == Side.SELL
+        assert signals[0].order.quantity == Decimal("30.00")
+
+    @pytest.mark.asyncio
     async def test_throttles_within_cycle_interval(self):
         strat = VolumeMill({"market": "SOMI:USDso", "size_per_cycle_usd": "20.00",
                               "cycle_interval_sec": 60})
@@ -271,6 +306,15 @@ class TestVolumeMill:
 # ════════════════════════════════════════════════════════════════════
 
 class TestYieldMaker:
+    def test_native_base_reserve_is_excluded_from_inventory_skew(self):
+        strat = YieldMaker({
+            "target_base_value_usd": "12.50",
+            "native_base_reserve_by_market": {"SOMI:USDso": "10"},
+        })
+        inv = make_inventory(MarketSymbol.SOMI_USDSO, quote="0", base="12")
+
+        assert strat._inventory_base_balance(inv) == Decimal("2")
+
     @pytest.mark.asyncio
     async def test_emits_both_sides_when_no_quotes_yet(self):
         """First tick should place both a bid and an ask."""

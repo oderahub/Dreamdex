@@ -25,6 +25,9 @@ import time
 from decimal import Decimal
 from typing import Any
 
+from eth_abi import decode, encode
+from eth_utils import keccak
+
 from dreamdex_bot.config import MARKETS, MarketSymbol, Settings
 from dreamdex_bot.core.rest_client import RestClient
 from dreamdex_bot.utils.logger import EvidenceLog, get_logger
@@ -306,6 +309,282 @@ async def probe_ws_reconnect_drift(*args, **kwargs) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════
+# Probe 9: Prepared order expiry field inspection
+# ════════════════════════════════════════════════════════════════════
+
+def _hex_data(tx: dict[str, Any]) -> str:
+    data = tx.get("data") or tx.get("calldata") or tx.get("input")
+    if not isinstance(data, str) or not data.startswith("0x"):
+        raise ValueError(f"prepared tx did not include hex calldata: keys={list(tx.keys())}")
+    return data
+
+
+def _decode_static_words(data: str) -> list[int]:
+    payload = data[10:] if data.startswith("0x") else data[8:]
+    words: list[int] = []
+    for i in range(0, len(payload), 64):
+        word = payload[i:i + 64]
+        if len(word) == 64:
+            words.append(int(word, 16))
+    return words
+
+
+def _timestamp_like_words(words: list[int]) -> list[dict[str, Any]]:
+    now_ns = int(time.time()) * 1_000_000_000
+    day_ns = 24 * 60 * 60 * 1_000_000_000
+    out = []
+    for idx, value in enumerate(words):
+        if value == 0 or now_ns - day_ns <= value <= now_ns + 7 * day_ns:
+            out.append({
+                "word_index": idx,
+                "value": str(value),
+                "looks_like": "zero" if value == 0 else "timestamp_ns_near_now",
+            })
+    return out
+
+
+async def probe_prepare_expiry_decode(
+    rest: RestClient, evidence: EvidenceLog, market: str,
+) -> dict:
+    """Prepare one IOC order and inspect the returned calldata words.
+
+    This checks whether REST prepare_order embeds an expireTimestampNs=0-style
+    value in the unsigned transaction. It does not broadcast anything.
+    """
+    book = await rest.get_orderbook(market, depth=1)
+    side = "buy"
+    price = Decimal("1")
+    if book.get("asks"):
+        price = Decimal(str(book["asks"][0]["price"]))
+    elif book.get("bids"):
+        side = "sell"
+        price = Decimal(str(book["bids"][0]["price"]))
+
+    spec = MARKETS[MarketSymbol(market)]
+    quantity = spec.min_quantity
+    client_order_id = f"probe_expiry_{int(time.time())}"
+    prepared = await rest.prepare_order(
+        market=market,
+        side=side,
+        order_type="ioc",
+        quantity=str(quantity),
+        price=str(price),
+        funding="wallet",
+        client_order_id=client_order_id,
+        wallet_address=rest.signer.address,
+    )
+    data = _hex_data(prepared)
+    words = _decode_static_words(data)
+    selector = data[:10]
+    timestamp_words = _timestamp_like_words(words)
+    zero_word_indexes = [w["word_index"] for w in timestamp_words if w["looks_like"] == "zero"]
+
+    evidence.record(
+        probe="prepare_expiry_decode",
+        market=market,
+        request={
+            "side": side,
+            "order_type": "ioc",
+            "quantity": str(quantity),
+            "price": str(price),
+            "client_order_id": client_order_id,
+        },
+        prepared_tx_summary={
+            "to": prepared.get("to"),
+            "value": prepared.get("value"),
+            "gas": prepared.get("gas") or prepared.get("gasLimit"),
+            "selector": selector,
+            "calldata_bytes": (len(data) - 2) // 2,
+            "word_count": len(words),
+        },
+        timestamp_or_zero_words=timestamp_words,
+        zero_word_indexes=zero_word_indexes,
+        verdict=(
+            "ZERO_WORDS_PRESENT_REVIEW_ABI"
+            if zero_word_indexes else "NO_ZERO_STATIC_WORDS_FOUND"
+        ),
+        notes=(
+            "Best-effort static calldata inspection. A zero word is not by itself proof "
+            "of expireTimestampNs=0 unless matched to the exact function ABI, but a "
+            "timestamp-like nonzero word near now+expiry is a useful positive signal."
+        ),
+    )
+    return {
+        "probe": "prepare_expiry_decode",
+        "completed": True,
+        "selector": selector,
+        "word_count": len(words),
+        "timestamp_or_zero_words": timestamp_words,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════
+# Probe 10: REST orderbook vs on-chain getBookLevels
+# ════════════════════════════════════════════════════════════════════
+
+GET_BOOK_LEVELS_INPUTS = [
+    ("getBookLevels(bool,uint64)", ["bool", "uint64"]),
+    ("getBookLevels(bool,uint256)", ["bool", "uint256"]),
+    ("getBookLevels(bool,uint128)", ["bool", "uint128"]),
+    ("getBookLevels(bool,uint16)", ["bool", "uint16"]),
+    ("getBookLevels(bool,uint8)", ["bool", "uint8"]),
+]
+
+GET_BOOK_LEVELS_OUTPUTS = [
+    ("tuple_array_u128", ["(uint128,uint128)[]"]),
+    ("tuple_array_u256", ["(uint256,uint256)[]"]),
+    ("parallel_u128_arrays", ["uint128[]", "uint128[]"]),
+    ("parallel_u256_arrays", ["uint256[]", "uint256[]"]),
+]
+
+
+def _selector(signature: str) -> str:
+    return "0x" + keccak(text=signature)[:4].hex()
+
+
+async def _call_get_book_levels(
+    rest: RestClient,
+    pool: str,
+    is_bid: bool,
+    depth: int,
+) -> dict[str, Any]:
+    last_error = None
+    for signature, input_types in GET_BOOK_LEVELS_INPUTS:
+        data = _selector(signature) + encode(input_types, [is_bid, depth]).hex()
+        try:
+            raw = await rest.signer.w3.eth.call({"to": pool, "data": data})
+        except Exception as e:
+            last_error = str(e)
+            continue
+        raw_hex = raw.hex() if hasattr(raw, "hex") else str(raw)
+        for output_name, output_types in GET_BOOK_LEVELS_OUTPUTS:
+            try:
+                decoded = decode(output_types, raw)
+                return {
+                    "signature": signature,
+                    "selector": _selector(signature),
+                    "output_schema": output_name,
+                    "raw": raw_hex,
+                    "decoded": decoded,
+                }
+            except Exception as e:
+                last_error = str(e)
+        return {
+            "signature": signature,
+            "selector": _selector(signature),
+            "raw": raw_hex,
+            "decode_error": last_error,
+        }
+    raise RuntimeError(f"getBookLevels call failed for all signatures: {last_error}")
+
+
+def _levels_from_decoded(decoded: Any, market: MarketSymbol) -> list[dict[str, str]]:
+    spec = MARKETS[market]
+    if not decoded:
+        return []
+    first = decoded[0]
+    pairs: list[tuple[int, int]] = []
+    if len(decoded) == 1 and isinstance(first, (list, tuple)):
+        pairs = [(int(p[0]), int(p[1])) for p in first]
+    elif len(decoded) == 2:
+        prices, quantities = decoded
+        pairs = [(int(p), int(q)) for p, q in zip(prices, quantities)]
+    levels = []
+    for price_raw, qty_raw in pairs:
+        if price_raw == 0 or qty_raw == 0:
+            continue
+        levels.append({
+            "price": str(Decimal(price_raw) / (Decimal(10) ** spec.quote_decimals)),
+            "quantity": str(Decimal(qty_raw) / (Decimal(10) ** spec.base_decimals)),
+            "price_raw": str(price_raw),
+            "quantity_raw": str(qty_raw),
+        })
+    return levels
+
+
+def _summarize_side(levels: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "price": str(level.get("price")),
+            "quantity": str(level.get("quantity")),
+        }
+        for level in levels
+    ]
+
+
+async def probe_book_source_compare(
+    rest: RestClient, evidence: EvidenceLog, market: str,
+) -> dict:
+    """Compare REST /v0/orderbooks to on-chain getBookLevels over time."""
+    market_symbol = MarketSymbol(market)
+    settings = Settings()
+    pool = settings.pool_address(market_symbol)
+    samples: list[dict[str, Any]] = []
+    mismatches = 0
+    sample_count = 5
+    interval_sec = 30
+
+    for i in range(sample_count):
+        rest_t0 = time.time()
+        rest_book = await rest.get_orderbook(market, depth=5)
+        rest_t1 = time.time()
+        chain_t0 = time.time()
+        chain_bids_raw = await _call_get_book_levels(rest, pool, True, 5)
+        chain_asks_raw = await _call_get_book_levels(rest, pool, False, 5)
+        chain_t1 = time.time()
+
+        chain_bids = _levels_from_decoded(chain_bids_raw.get("decoded"), market_symbol)
+        chain_asks = _levels_from_decoded(chain_asks_raw.get("decoded"), market_symbol)
+        rest_bids = _summarize_side(rest_book.get("bids", [])[:5])
+        rest_asks = _summarize_side(rest_book.get("asks", [])[:5])
+
+        equivalent = rest_bids == _summarize_side(chain_bids) and rest_asks == _summarize_side(chain_asks)
+        if not equivalent:
+            mismatches += 1
+        sample = {
+            "sample": i,
+            "rest_started_at": rest_t0,
+            "rest_finished_at": rest_t1,
+            "chain_started_at": chain_t0,
+            "chain_finished_at": chain_t1,
+            "delta_rest_to_chain_start_sec": chain_t0 - rest_t1,
+            "pool": pool,
+            "rest": {"bids": rest_bids, "asks": rest_asks},
+            "chain": {"bids": chain_bids, "asks": chain_asks},
+            "chain_call": {
+                "bids_signature": chain_bids_raw.get("signature"),
+                "bids_output_schema": chain_bids_raw.get("output_schema"),
+                "asks_signature": chain_asks_raw.get("signature"),
+                "asks_output_schema": chain_asks_raw.get("output_schema"),
+            },
+            "equivalent": equivalent,
+        }
+        samples.append(sample)
+        evidence.record(probe="book_source_compare_sample", market=market, **sample)
+        if i < sample_count - 1:
+            await asyncio.sleep(interval_sec)
+
+    verdict = "REST_CHAIN_MATCHED_ALL_SAMPLES" if mismatches == 0 else "REST_CHAIN_DISAGREED"
+    evidence.record(
+        probe="book_source_compare",
+        market=market,
+        sample_count=sample_count,
+        interval_sec=interval_sec,
+        mismatches=mismatches,
+        verdict=verdict,
+        samples=samples,
+    )
+    return {
+        "probe": "book_source_compare",
+        "completed": True,
+        "market": market,
+        "sample_count": sample_count,
+        "mismatches": mismatches,
+        "verdict": verdict,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════
 # Registry
 # ════════════════════════════════════════════════════════════════════
 
@@ -318,4 +597,6 @@ PROBES: dict[str, Any] = {
     "ioc_empty_book": probe_ioc_empty_book,
     "rate_limit_burst": probe_rate_limit_burst,
     "ws_reconnect_drift": probe_ws_reconnect_drift,
+    "prepare_expiry_decode": probe_prepare_expiry_decode,
+    "book_source_compare": probe_book_source_compare,
 }

@@ -71,6 +71,9 @@ DEFAULT_CONFIG = {
             "min_side_depth_usd": 2.50,
             "depth_usage_fraction": 0.50,
             "ioc_cross_bps": 5.0,
+            "native_base_reserve_by_market": {
+                "SOMI:USDso": "10.00",
+            },
         },
         "yield_maker": {
             "enabled": False,
@@ -82,6 +85,9 @@ DEFAULT_CONFIG = {
             "requote_threshold_bps": 5,
             "requote_min_interval_sec": 3.0,
             "vol_window": 60,
+            "native_base_reserve_by_market": {
+                "SOMI:USDso": "10.00",
+            },
         },
     },
     "risk": {
@@ -89,6 +95,7 @@ DEFAULT_CONFIG = {
         "inventory_drift": {
             "market": "SOMI:USDso", "max_drift_usd": "10.00",
             "target_base_usd": "12.50", "strategy": "yield_maker",
+            "native_base_reserve_by_market": {"SOMI:USDso": "10.00"},
         },
         "failed_tx_streak": {"max_streak": 5},
         "ws_staleness": {"max_silence_sec": 60.0},

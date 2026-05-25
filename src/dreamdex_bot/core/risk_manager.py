@@ -18,7 +18,7 @@ import time
 from decimal import Decimal
 from typing import Any
 
-from dreamdex_bot.config import MarketSymbol
+from dreamdex_bot.config import MARKETS, MarketSymbol
 from dreamdex_bot.interfaces.risk import (
     AccountMetrics, RiskAction, RiskEvent, RiskRule, Severity,
 )
@@ -66,7 +66,8 @@ class InventoryDriftRule(RiskRule):
         ms = market_state.get(market)
         if inv is None or ms is None or ms.mid is None:
             return events
-        base_value_usd = inv.base_balance * ms.mid
+        base_balance = self._risk_base_balance(market, inv)
+        base_value_usd = base_balance * ms.mid
         drift = abs(base_value_usd - target_base_usd)
         if drift > max_drift:
             events.append(RiskEvent(
@@ -78,11 +79,20 @@ class InventoryDriftRule(RiskRule):
                 market=market,
                 metadata={
                     "base_value_usd": str(base_value_usd),
+                    "base_balance": str(base_balance),
+                    "raw_base_balance": str(inv.base_balance),
                     "target_usd": str(target_base_usd),
                     "drift_usd": str(drift),
                 },
             ))
         return events
+
+    def _risk_base_balance(self, market: MarketSymbol, inv: OwnInventory) -> Decimal:
+        if not MARKETS[market].is_base_native:
+            return inv.base_balance
+        reserve_by_market = self.config.get("native_base_reserve_by_market", {})
+        reserve = Decimal(str(reserve_by_market.get(market.value, "0")))
+        return max(Decimal("0"), inv.base_balance - min(inv.base_balance, reserve))
 
 
 class FailedTxStreakRule(RiskRule):

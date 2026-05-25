@@ -169,6 +169,7 @@ class Engine:
         min_ask_depth = Decimal(str(cfg.get("min_ask_depth_usd", "5")))
 
         best: tuple[Decimal, MarketSymbol, Decimal, Decimal, Decimal] | None = None
+        base_available_markets: list[dict[str, str]] = []
         for market in candidates:
             state = self.inventory_tracker.get(market)
             ms = self.market_state.get(market)
@@ -176,6 +177,10 @@ class Engine:
                 continue
             base_value = state.free_base * ms.best_ask
             if base_value >= min_base_value:
+                base_available_markets.append({
+                    "market": market.value,
+                    "base_value_usd": str(base_value),
+                })
                 log.info(
                     "bootstrap.skipped_base_already_available",
                     market=market.value, base_value_usd=str(base_value),
@@ -186,7 +191,7 @@ class Engine:
                     market=market.value,
                     base_value_usd=str(base_value),
                 )
-                return
+                continue
             free_quote = state.free_quote
             if free_quote < min_quote:
                 continue
@@ -231,6 +236,7 @@ class Engine:
                 event="bootstrap_no_suitable_market",
                 category="bootstrap",
                 candidates=[m.value for m in candidates],
+                base_available_markets=base_available_markets,
                 min_quote=str(min_quote),
                 max_spread_bps=str(max_spread_bps),
                 min_ask_depth_usd=str(min_ask_depth),

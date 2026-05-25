@@ -53,6 +53,10 @@ class YieldMaker(TradingStrategy):
         self.k_vol = float(config.get("k_vol", 2.0))
         self.requote_threshold_bps = int(config.get("requote_threshold_bps", 5))
         self.requote_min_interval_sec = float(config.get("requote_min_interval_sec", 3.0))
+        reserve_by_market = config.get("native_base_reserve_by_market", {})
+        self.native_base_reserve = Decimal(str(
+            reserve_by_market.get(self.market.value, config.get("native_base_reserve", "0"))
+        ))
 
         # Quote tracking: set when we emit PLACE, cleared on fill/reject/cancel.
         # Each is None when no resting order is known, otherwise:
@@ -77,7 +81,7 @@ class YieldMaker(TradingStrategy):
 
         # Reservation price
         sigma = self._realized_vol()
-        q_delta_usd = (inv.base_balance * ms.mid) - self.target_base_value_usd
+        q_delta_usd = (self._inventory_base_balance(inv) * ms.mid) - self.target_base_value_usd
         q_normalized = float(q_delta_usd / self.target_base_value_usd) if self.target_base_value_usd > 0 else 0.0
         reservation_shift = q_normalized * self.gamma * (sigma ** 2) * float(ms.mid)
         reservation_price = float(ms.mid) - reservation_shift
@@ -181,6 +185,12 @@ class YieldMaker(TradingStrategy):
                 reason="yield_maker quote",
             ),
         )
+
+    def _inventory_base_balance(self, inv: OwnInventory) -> Decimal:
+        if not MARKETS[self.market].is_base_native:
+            return inv.base_balance
+        reserved = min(inv.base_balance, self.native_base_reserve)
+        return max(Decimal("0"), inv.base_balance - reserved)
 
     def _record_placement(self, side: Side, order: OrderIntent) -> None:
         """Fix for gap #3: track that we have a resting quote on this side

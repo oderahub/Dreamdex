@@ -85,6 +85,27 @@ class TestInventoryDriftRule:
         assert events[0].action == RiskAction.PAUSE_STRATEGY
         assert events[0].strategy == "yield_maker"
 
+    def test_native_base_reserve_is_excluded_from_drift(self):
+        rule = InventoryDriftRule("inventory_drift", {
+            "market": "SOMI:USDso", "max_drift_usd": "1.00",
+            "target_base_usd": "0", "strategy": "yield_maker",
+            "native_base_reserve_by_market": {"SOMI:USDso": "10"},
+        })
+        ms = MarketState(market=MarketSymbol.SOMI_USDSO,
+                          best_bid=Decimal("0.5"), best_ask=Decimal("0.51"),
+                          mid=Decimal("0.505"),
+                          bid_depth_usd=Decimal("0"), ask_depth_usd=Decimal("0"),
+                          last_trade_price=None, volatility_5m=None, ts=time.time())
+        inv = OwnInventory(market=MarketSymbol.SOMI_USDSO,
+                            base_balance=Decimal("10"), quote_balance=Decimal("0"),
+                            base_locked_in_orders=Decimal("0"), quote_locked_in_orders=Decimal("0"),
+                            realized_pnl_usd=Decimal("0"), unrealized_pnl_usd=Decimal("0"))
+
+        events = rule.evaluate({MarketSymbol.SOMI_USDSO: ms},
+                                {MarketSymbol.SOMI_USDSO: inv}, make_metrics())
+
+        assert events == []
+
 
 class TestFailedTxStreakRule:
     def test_fires_at_threshold(self):

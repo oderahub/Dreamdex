@@ -101,6 +101,68 @@ That warning is important and correct. Bot authors should not equate successful 
 
 `gas_estimate_failed`: local `eth_estimateGas` fails. The bot now treats this as a contained pre-broadcast issue, records it, and falls back conservatively only where appropriate.
 
+Follow-up measurement on May 25 found a likely contributor to the clean IOC
+simulation rejects: REST `/v0/orderbooks` and on-chain `getBookLevels` can
+briefly disagree at top of book during testnet movement. In 5-sample runs, the
+latest probe saw 1/5 mismatches on `SOMI:USDso`, 2/5 on `WETH:USDso`, and 2/5
+on `WBTC:USDso`, generally within a few ticks and a 2.3-3.4s measurement
+window. This makes simulate-before-broadcast non-optional for IOC bots.
+
+### Silent status-1 receipts with empty logs are reproducible beyond zero-expiry
+
+On May 25, I also reproduced the status-1/empty-logs path while manually
+swapping native SOMI/STT into USDso on the `SOMI:USDso` testnet pool
+`0x259fD6559214dd5aD3752322426eA9F9fABEFff4`.
+
+Successful control tx:
+
+```text
+tx: 0xf6cad0fea122fbc3c052f9f1d836b8b988c7514a3ef56581f0966c283f0ab1f6
+selector: 0x1c792779
+value: 50 SOMI
+limit price raw: 170100000000000000
+quantity raw: 50000000000000000000
+expireTimestampNs candidate: 1779788920541467357
+expireTimestampNs UTC: 2026-05-26T09:48:40Z
+receipt status: 1
+logs_count: 4
+gas_used: 499526
+```
+
+Silent no-fill txs:
+
+```text
+tx: 0xd4a0deeec2600a65d13d5c88b636b7bd124d71972c7787d1e3f59b626656b211
+selector: 0x1c792779
+value: 50 SOMI
+limit price raw: 170700000000000000
+quantity raw: 50000000000000000000
+expireTimestampNs candidate: 1779788715816155188
+expireTimestampNs UTC: 2026-05-26T09:45:15Z
+receipt status: 1
+logs_count: 0
+gas_used: 159322
+
+tx: 0x0e07d732d074335a70f35f78c4b269f6934f84ed57599e487905c0866cc7fa2f
+selector: 0x1c792779
+value: 50 SOMI
+limit price raw: 170100000000000000
+quantity raw: 50000000000000000000
+expireTimestampNs candidate: 1779788926051260404
+expireTimestampNs UTC: 2026-05-26T09:48:46Z
+receipt status: 1
+logs_count: 0
+gas_used: 159322
+```
+
+These failed examples had non-zero future expiry timestamps, so the
+status-1/empty-logs pattern is broader than the known `expireTimestampNs = 0`
+docs discrepancy. In this case the likely trigger is IOC book movement or no
+crossing liquidity by execution time. The important bot-author takeaway is the
+same: receipt `status == 1` is not sufficient evidence that an order was placed
+or filled; bots must check return values during `eth_call` and logs after
+broadcast.
+
 ### Approval gas discovery
 
 The most concrete gas issue was approval gas. The prepare response gave an approval gas hint that was too low for the observed USDso approval path. During testing, approval transactions failed on-chain until local estimation and buffering were added. A manual high-gas diagnostic showed the approval path could require far more than a standard ERC-20 `approve`.
