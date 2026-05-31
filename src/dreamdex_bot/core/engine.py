@@ -743,8 +743,13 @@ class Engine:
 
         state = self.inventory_tracker.get(order.market)
         if order.side == Side.BUY:
-            if self._buy_block_reason() is not None:
-                reason = self._buy_block_reason()
+            if order.price is None:
+                return True
+            token = self.settings.quote_token(order.market).lower()
+            needed = order.quantity * order.price
+            reserved = quote_reserved_by_token.get(token, Decimal(0))
+            reason = self._buy_block_reason(projected_quote_spend=needed + reserved)
+            if reason is not None:
                 log.warning(
                     "engine.buy_blocked",
                     market=order.market.value, coid=order.client_order_id, reason=reason,
@@ -757,11 +762,7 @@ class Engine:
                     reason=reason,
                 )
                 return False
-            if order.price is None:
-                return True
-            token = self.settings.quote_token(order.market).lower()
-            needed = order.quantity * order.price
-            available = state.free_quote - quote_reserved_by_token.get(token, Decimal(0))
+            available = state.free_quote - reserved
             if needed > available:
                 log.warning(
                     "engine.tick_order_skipped_insufficient_quote",
@@ -869,7 +870,7 @@ class Engine:
     def request_safe_exit(self, reason: str) -> None:
         self._request_safe_exit(reason)
 
-    def _buy_block_reason(self) -> str | None:
+    def _buy_block_reason(self, projected_quote_spend: Decimal = Decimal(0)) -> str | None:
         if self._safe_exit_requested:
             return self._safe_exit_reason or "safe_exit_requested"
         native_floor = Decimal(str(self.unattended_config.get("min_native_somi", "0")))
@@ -881,8 +882,12 @@ class Engine:
             (state.wallet_quote for state in self.inventory_tracker.states.values()),
             default=Decimal(0),
         )
-        if quote_floor > 0 and wallet_quote < quote_floor:
-            return f"liquid_usdso_below_floor:{wallet_quote}<{quote_floor}"
+        projected_quote = wallet_quote - projected_quote_spend
+        if quote_floor > 0 and projected_quote < quote_floor:
+            return (
+                f"projected_liquid_usdso_below_floor:"
+                f"{wallet_quote}-{projected_quote_spend}={projected_quote}<{quote_floor}"
+            )
         return None
 
     def _has_tradable_erc20_inventory(self) -> bool:

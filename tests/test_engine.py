@@ -849,6 +849,49 @@ class TestUnattendedSafeguards:
 
         assert engine._reserve_tick_balance(signal, {}, {}) is False
 
+    def test_buy_is_blocked_when_projected_quote_crosses_floor(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"min_liquid_usdso": "25"}
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("32"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("12"),
+            price=Decimal("1"),
+            funding=FundingSource.WALLET,
+            client_order_id="projected-quote-floor",
+        ))
+
+        assert engine._reserve_tick_balance(signal, {}, {}) is False
+
+    def test_buy_is_blocked_when_same_tick_reservations_cross_floor(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"min_liquid_usdso": "25"}
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("35"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("0.002"),
+            price=Decimal("2000"),
+            funding=FundingSource.WALLET,
+            client_order_id="reserved-quote-floor",
+        ))
+        quote_token = engine.settings.quote_token(MarketSymbol.SOMI_USDSO).lower()
+
+        assert engine._reserve_tick_balance(
+            signal, {quote_token: Decimal("7")}, {},
+        ) is False
+
     def test_sell_is_allowed_below_floors(self, fake_components):
         engine, _, _, _, _ = fake_components
         engine.unattended_config = {"min_native_somi": "3", "min_liquid_usdso": "25"}

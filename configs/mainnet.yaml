@@ -41,7 +41,7 @@ strategies:
     markets:
       - WETH:USDso
       - WBTC:USDso
-    cycle_interval_sec: 4.0
+    cycle_interval_sec: 15.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "4.00"
