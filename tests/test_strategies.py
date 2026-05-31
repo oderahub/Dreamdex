@@ -242,6 +242,78 @@ class TestVolumeMill:
         assert sell[0].order.price == Decimal("0.4995")
 
     @pytest.mark.asyncio
+    async def test_profit_aware_exit_waits_until_target_bid(self):
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "size_per_cycle_usd": "4",
+            "max_spread_bps": "100",
+            "min_side_depth_usd": "1",
+            "cycle_interval_sec": "0",
+            "profit_aware_exit_enabled": True,
+            "take_profit_bps": "10",
+        })
+        buy_book = make_market_state_with_depth(
+            MarketSymbol.WETH_USDSO, "2045.93", "2046.35", "1000", "1000",
+        )
+        buy = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: buy_book},
+            {MarketSymbol.WETH_USDSO: make_inventory(MarketSymbol.WETH_USDSO, quote="50")},
+        )
+        assert buy[0].order.side == Side.BUY
+
+        weak_bid = make_market_state_with_depth(
+            MarketSymbol.WETH_USDSO, "2046.00", "2046.42", "1000", "1000",
+        )
+        wait = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: weak_bid},
+            {MarketSymbol.WETH_USDSO: make_inventory(MarketSymbol.WETH_USDSO, quote="46", base="0.0019")},
+        )
+        assert wait == []
+        assert strat.last_skip_reason == "profit_target_not_reached"
+
+        strong_bid = make_market_state_with_depth(
+            MarketSymbol.WETH_USDSO, "2050.00", "2050.42", "1000", "1000",
+        )
+        sell = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: strong_bid},
+            {MarketSymbol.WETH_USDSO: make_inventory(MarketSymbol.WETH_USDSO, quote="46", base="0.0019")},
+        )
+        assert sell[0].order.side == Side.SELL
+        assert sell[0].order.price >= Decimal("2048.00")
+
+    @pytest.mark.asyncio
+    async def test_profit_aware_exit_flattens_after_timeout(self):
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "size_per_cycle_usd": "4",
+            "max_spread_bps": "100",
+            "min_side_depth_usd": "1",
+            "cycle_interval_sec": "0",
+            "profit_aware_exit_enabled": True,
+            "take_profit_bps": "10",
+            "max_hold_sec": "1",
+        })
+        buy_book = make_market_state_with_depth(
+            MarketSymbol.WETH_USDSO, "2045.93", "2046.35", "1000", "1000",
+        )
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: buy_book},
+            {MarketSymbol.WETH_USDSO: make_inventory(MarketSymbol.WETH_USDSO, quote="50")},
+        )
+        strat._last_cycle_ts = 0
+        strat._entry_ts = time.time() - 2
+
+        weak_bid = make_market_state_with_depth(
+            MarketSymbol.WETH_USDSO, "2046.00", "2046.42", "1000", "1000",
+        )
+        sell = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: weak_bid},
+            {MarketSymbol.WETH_USDSO: make_inventory(MarketSymbol.WETH_USDSO, quote="46", base="0.0019")},
+        )
+        assert sell[0].order.side == Side.SELL
+        assert sell[0].order.price < Decimal("2046.00")
+
+    @pytest.mark.asyncio
     async def test_uses_per_market_cycle_size(self):
         strat = VolumeMill({
             "market": "WETH:USDso",

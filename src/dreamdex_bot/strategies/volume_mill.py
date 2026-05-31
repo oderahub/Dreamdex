@@ -52,6 +52,12 @@ class VolumeMill(TradingStrategy):
         self.min_side_depth_usd = Decimal(str(config.get("min_side_depth_usd", "1.00")))
         self.depth_usage_fraction = Decimal(str(config.get("depth_usage_fraction", "0.50")))
         self.ioc_cross_bps = Decimal(str(config.get("ioc_cross_bps", "5.0")))
+        self.profit_aware_exit_enabled = bool(config.get("profit_aware_exit_enabled", False))
+        self.take_profit_bps = Decimal(str(config.get("take_profit_bps", "0")))
+        self.max_hold_sec = float(config.get("max_hold_sec", 0))
+        self.entry_max_spread_bps = Decimal(str(
+            config.get("entry_max_spread_bps", self.max_spread_bps)
+        ))
         reserve_by_market = config.get("native_base_reserve_by_market", {})
         self.native_base_reserve = Decimal(str(
             reserve_by_market.get(
@@ -62,6 +68,8 @@ class VolumeMill(TradingStrategy):
 
         self._last_cycle_ts: float = 0
         self._last_action: Side | None = None
+        self._entry_price: Decimal | None = None
+        self._entry_ts: float | None = None
         self._warned_no_balance: bool = False
         self.last_skip_reason: str | None = None
 
@@ -100,15 +108,15 @@ class VolumeMill(TradingStrategy):
         # Once we see balance, allow the warning to reset for future zero-states
         if free_quote > 0 or tradable_base > 0:
             self._warned_no_balance = False
+        if tradable_base <= 0:
+            self._clear_entry()
 
         # If we hold base above the imbalance threshold, sell to flatten.
         max_base_units = self.max_inventory_imbalance
         if self.max_inventory_imbalance_usd > 0:
             max_base_units = self.max_inventory_imbalance_usd / ms.best_bid
         if tradable_base > max_base_units:
-            qty = round_to_lot(tradable_base, self.market, direction="down")
-            qty = self._cap_qty_to_depth(qty, ms.best_bid, ms.bid_depth_usd)
-            qty_checked = ensure_min_quantity(qty, self.market)
+            qty_checked = self._sell_qty_for_depth(tradable_base, ms.best_bid, ms.bid_depth_usd)
             if qty_checked is None or qty_checked <= 0:
                 self._skip("sell_qty_too_small_after_depth_cap", market=self.market.value)
                 return []
@@ -133,6 +141,11 @@ class VolumeMill(TradingStrategy):
         # Otherwise ping-pong: if last action was BUY, sell remaining base.
         # Otherwise (or if nothing held) buy fresh.
         if self._last_action == Side.BUY and tradable_base > 0:
+            if self.profit_aware_exit_enabled:
+                sell = self._profit_aware_sell_signal(ms, tradable_base)
+                if sell is not None:
+                    return [sell]
+                return []
             sell = self._sell_all_signal(ms, tradable_base)
             if sell:
                 return sell
@@ -141,6 +154,16 @@ class VolumeMill(TradingStrategy):
 
     def _buy_cycle(self, ms: MarketState, free_quote: Decimal) -> list[TradingSignal]:
         assert ms.best_ask is not None
+        if self.profit_aware_exit_enabled:
+            spread_bps = self._spread_bps(ms)
+            if spread_bps is not None and spread_bps > self.entry_max_spread_bps:
+                self._skip(
+                    "entry_spread_too_wide",
+                    market=self.market.value,
+                    spread_bps=str(spread_bps),
+                    entry_max_spread_bps=str(self.entry_max_spread_bps),
+                )
+                return []
         usable_ask_depth = ms.ask_depth_usd * self.depth_usage_fraction
         target_usd = min(self.size_per_cycle_usd, free_quote * Decimal("0.95"), usable_ask_depth)
         if target_usd <= 0:
@@ -166,7 +189,9 @@ class VolumeMill(TradingStrategy):
             return []
         self._last_cycle_ts = time.time()
         self._last_action = Side.BUY
-        return [self._buy_signal(qty_checked, self._buy_cross_price(ms.best_ask))]
+        price = self._buy_cross_price(ms.best_ask)
+        self._record_entry(price)
+        return [self._buy_signal(qty_checked, price)]
 
     def _buy_signal(self, qty: Decimal, price: Decimal) -> TradingSignal:
         return TradingSignal(
@@ -235,6 +260,16 @@ class VolumeMill(TradingStrategy):
         reserved = min(inv.base_balance, self.native_base_reserve)
         return max(Decimal("0"), inv.base_balance - reserved)
 
+    def _record_entry(self, price: Decimal) -> None:
+        if not self.profit_aware_exit_enabled:
+            return
+        self._entry_price = price
+        self._entry_ts = time.time()
+
+    def _clear_entry(self) -> None:
+        self._entry_price = None
+        self._entry_ts = None
+
     def _skip(self, reason: str, **fields: Any) -> None:
         self.last_skip_reason = reason
         log.info("volume_mill.skip", reason=reason, **fields)
@@ -247,17 +282,72 @@ class VolumeMill(TradingStrategy):
         multiplier = Decimal("1") - self.ioc_cross_bps / Decimal("10000")
         return round_to_tick(best_bid * multiplier, self.market, direction="down")
 
+    def _profit_target_price(self) -> Decimal | None:
+        if self._entry_price is None:
+            return None
+        multiplier = Decimal("1") + self.take_profit_bps / Decimal("10000")
+        return round_to_tick(self._entry_price * multiplier, self.market, direction="down")
+
+    def _profit_aware_sell_signal(
+        self,
+        ms: MarketState,
+        base_balance: Decimal,
+    ) -> TradingSignal | None:
+        assert ms.best_bid is not None
+        target = self._profit_target_price()
+        if target is None:
+            sell = self._sell_all_signal(ms, base_balance)
+            return sell[0] if sell else None
+
+        if ms.best_bid >= target:
+            qty = self._sell_qty_for_depth(base_balance, ms.best_bid, ms.bid_depth_usd)
+            if qty is None:
+                return None
+            self._last_cycle_ts = time.time()
+            self._last_action = Side.SELL
+            return self._sell_signal(qty, target)
+
+        held_sec = time.time() - self._entry_ts if self._entry_ts is not None else 0
+        if self.max_hold_sec > 0 and held_sec >= self.max_hold_sec:
+            sell = self._sell_all_signal(ms, base_balance)
+            if sell:
+                log.info(
+                    "volume_mill.profit_exit_timeout",
+                    market=self.market.value,
+                    best_bid=str(ms.best_bid),
+                    target=str(target),
+                    held_sec=f"{held_sec:.1f}",
+                )
+                return sell[0]
+            return None
+
+        self._skip(
+            "profit_target_not_reached",
+            market=self.market.value,
+            best_bid=str(ms.best_bid),
+            target=str(target),
+        )
+        return None
+
     def _sell_all_signal(self, ms: MarketState, base_balance: Decimal) -> list[TradingSignal]:
         assert ms.best_bid is not None
-        qty = round_to_lot(base_balance, self.market, direction="down")
-        qty = self._cap_qty_to_depth(qty, ms.best_bid, ms.bid_depth_usd)
-        qty_checked = ensure_min_quantity(qty, self.market)
+        qty_checked = self._sell_qty_for_depth(base_balance, ms.best_bid, ms.bid_depth_usd)
         if qty_checked and qty_checked > 0:
             self._last_cycle_ts = time.time()
             self._last_action = Side.SELL
             return [self._sell_signal(qty_checked, self._sell_cross_price(ms.best_bid))]
         self._skip("sell_qty_too_small_after_depth_cap", market=self.market.value)
         return []
+
+    def _sell_qty_for_depth(
+        self,
+        base_balance: Decimal,
+        best_bid: Decimal,
+        bid_depth_usd: Decimal,
+    ) -> Decimal | None:
+        qty = round_to_lot(base_balance, self.market, direction="down")
+        qty = self._cap_qty_to_depth(qty, best_bid, bid_depth_usd)
+        return ensure_min_quantity(qty, self.market)
 
     def _sell_signal(self, qty: Decimal, price: Decimal) -> TradingSignal:
         return TradingSignal(

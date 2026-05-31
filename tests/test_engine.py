@@ -612,6 +612,42 @@ class TestPreparedOrderGas:
         assert engine._submitted_approvals[("SOMI:USDso", "USDso")] == Decimal("1000000000000000000")
 
     @pytest.mark.asyncio
+    async def test_existing_onchain_allowance_skips_approval_tx(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        signer.w3.eth.call.return_value = (2 * 10**18).to_bytes(32, "big")
+        rest.prepare_vault_approve = AsyncMock()
+
+        key, amount = await engine._submit_approval(MarketSymbol.SOMI_USDSO, {
+            "token": engine.settings.quote_token(MarketSymbol.SOMI_USDSO),
+            "amount": "1000000000000000000",
+        })
+
+        assert key == ("SOMI:USDso", "USDso")
+        assert amount == Decimal("1000000000000000000")
+        rest.prepare_vault_approve.assert_not_awaited()
+        signer.send_tx.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_max_approval_mode_requests_reusable_allowance(self, fake_components):
+        engine, signer, rest, _, _ = fake_components
+        engine.approval_config = {"mode": "max"}
+        rest.prepare_vault_approve = AsyncMock(return_value={
+            "to": "0xtoken", "data": "0xapprove", "value": 0, "gas": 200_000,
+        })
+        signer.wait_for_receipt.return_value = {"status": 1, "blockNumber": 10}
+
+        await engine._submit_approval(MarketSymbol.SOMI_USDSO, {
+            "token": engine.settings.quote_token(MarketSymbol.SOMI_USDSO),
+            "amount": "1000000000000000000",
+        })
+
+        max_allowance = str(2**256 - 1)
+        rest.prepare_vault_approve.assert_awaited_once_with(
+            "SOMI:USDso", signer.address, "USDso", max_allowance,
+        )
+        assert engine._submitted_approvals[("SOMI:USDso", "USDso")] == Decimal(max_allowance)
+
+    @pytest.mark.asyncio
     async def test_place_order_consumes_finite_approval_cache(self, fake_components):
         engine, signer, rest, _, _ = fake_components
         rest.prepare_order = AsyncMock(return_value={
@@ -770,3 +806,97 @@ class TestTickBalanceReservation:
 
         assert engine._reserve_tick_balance(first, reserved_quote, reserved_base) is True
         assert engine._reserve_tick_balance(second, reserved_quote, reserved_base) is False
+
+
+class TestUnattendedSafeguards:
+    def test_buy_is_blocked_below_native_gas_floor(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"min_native_somi": "3"}
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("2.9"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="gas-floor",
+        ))
+
+        assert engine._reserve_tick_balance(signal, {}, {}) is False
+
+    def test_buy_is_blocked_below_liquid_quote_floor(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"min_liquid_usdso": "25"}
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("24.9"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="quote-floor",
+        ))
+
+        assert engine._reserve_tick_balance(signal, {}, {}) is False
+
+    def test_sell_is_allowed_below_floors(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"min_native_somi": "3", "min_liquid_usdso": "25"}
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("2"), wallet_quote=Decimal("1"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.SELL,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="sell-through-floor",
+        ))
+
+        assert engine._reserve_tick_balance(signal, {}, {}) is True
+
+    def test_drawdown_requires_repeated_snapshots(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"drawdown_confirmations": 3}
+        event = RiskEvent(
+            rule_name="max_drawdown", action=RiskAction.KILL_SWITCH,
+            severity=Severity.CRITICAL, reason="temporary stale balance",
+        )
+
+        assert engine._confirm_drawdown_events([event]) == []
+        assert engine._confirm_drawdown_events([event]) == []
+        assert engine._confirm_drawdown_events([event]) == [event]
+
+    def test_runtime_limit_requests_safe_exit(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"max_runtime_sec": 1}
+        engine._started_ts -= 2
+
+        engine._check_unattended_limits()
+
+        assert engine._safe_exit_requested is True
+        assert engine._safe_exit_reason == "max_runtime_reached"
+
+    def test_order_cap_requests_safe_exit(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine.unattended_config = {"max_submitted_orders": 2}
+        engine._submitted_order_count = 2
+
+        engine._check_unattended_limits()
+
+        assert engine._safe_exit_requested is True
+        assert engine._safe_exit_reason == "max_submitted_orders_reached"

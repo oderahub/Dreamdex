@@ -238,6 +238,8 @@ async def main(config_path: str | None) -> None:
         starting_capital_usd=starting_capital,
         markets_to_watch=markets_to_watch,
         bootstrap_config=cfg.get("bootstrap", {}),
+        approval_config=cfg.get("wallet_approvals", {}),
+        unattended_config=cfg.get("unattended", {}),
         reporter=reporter,
     )
     await engine.initialize()
@@ -256,19 +258,34 @@ async def main(config_path: str | None) -> None:
     async def shutdown_watcher():
         await stop_evt.wait()
         log.warning("bot.shutdown_requested")
-        engine.stop()
-        ws.stop()
-        signer.nonces.stop()
+        engine.request_safe_exit("signal_received")
 
     # ─── Run everything concurrently ──────────────────────────────────
+    ws_task = asyncio.create_task(ws.start())
+    nonce_task = asyncio.create_task(signer.nonces.reconcile_loop())
+    engine_task = asyncio.create_task(engine.run())
+    shutdown_task = asyncio.create_task(shutdown_watcher())
     try:
-        await asyncio.gather(
-            ws.start(),
-            signer.nonces.reconcile_loop(),
-            engine.run(),
-            shutdown_watcher(),
+        done, _ = await asyncio.wait(
+            {engine_task, shutdown_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        if shutdown_task in done and not engine_task.done():
+            try:
+                await asyncio.wait_for(engine_task, timeout=120)
+            except asyncio.TimeoutError:
+                log.warning("bot.safe_exit_timeout")
+                engine.stop()
     finally:
+        ws.stop()
+        signer.nonces.stop()
+        for task in (ws_task, nonce_task, engine_task, shutdown_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            ws_task, nonce_task, engine_task, shutdown_task,
+            return_exceptions=True,
+        )
         reporter.record(
             event="bot_stopped",
             category="shutdown",

@@ -155,14 +155,18 @@ class WsClient:
                 asyncio.create_task(self._ping_loop()),
                 asyncio.create_task(self._read_loop()),
             ]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for t in pending:
-                t.cancel()
-            # Re-raise any exception from the finished task
-            for t in done:
-                exc = t.exception()
-                if exc is not None:
-                    raise exc
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+                # Re-raise any exception from the finished task
+                for t in done:
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _send_subscriptions(self) -> None:
         """Subscribe to all registered channels using the documented protocol."""

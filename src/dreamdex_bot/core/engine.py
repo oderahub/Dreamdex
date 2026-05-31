@@ -20,6 +20,8 @@ import time
 from decimal import Decimal
 from typing import Any
 
+from web3 import Web3
+
 from dreamdex_bot.config import MARKETS, MarketSymbol, Settings
 from dreamdex_bot.core.inventory import InventoryTracker
 from dreamdex_bot.core.rest_client import RestClient
@@ -32,7 +34,7 @@ from dreamdex_bot.interfaces.strategy import (
     TradingSignal, TradingStrategy,
 )
 from dreamdex_bot.utils.logger import EvidenceLog, get_logger
-from dreamdex_bot.utils.markets import ensure_min_quantity, raw_to_decimal, round_to_lot
+from dreamdex_bot.utils.markets import ensure_min_quantity, raw_to_decimal, round_to_lot, round_to_tick
 
 
 log = get_logger(__name__)
@@ -50,6 +52,8 @@ class Engine:
         starting_capital_usd: Decimal,
         markets_to_watch: list[MarketSymbol],
         bootstrap_config: dict[str, Any] | None = None,
+        approval_config: dict[str, Any] | None = None,
+        unattended_config: dict[str, Any] | None = None,
         reporter: EvidenceLog | None = None,
     ) -> None:
         self.settings = settings
@@ -61,6 +65,8 @@ class Engine:
         self.starting_capital_usd = starting_capital_usd
         self.markets_to_watch = markets_to_watch
         self.bootstrap_config = bootstrap_config or {}
+        self.approval_config = approval_config or {}
+        self.unattended_config = unattended_config or {}
         self.reporter = reporter
 
         self.market_state: dict[MarketSymbol, MarketState] = {}
@@ -79,6 +85,11 @@ class Engine:
         self._last_balance_refresh_ts: float = 0.0
         self._balance_refresh_min_interval_sec: float = 5.0
         self._submitted_approvals: dict[tuple[str, str], Decimal] = {}
+        self._started_ts = time.time()
+        self._submitted_order_count = 0
+        self._safe_exit_requested = False
+        self._safe_exit_reason: str | None = None
+        self._drawdown_breach_count = 0
 
     # ────────────────────────────────────────────────────────────────
     # Setup
@@ -384,7 +395,10 @@ class Engine:
             return Decimal(0)
         addr = self.signer.address.lower().removeprefix("0x").rjust(64, "0")
         data = "0x70a08231" + addr
-        raw_bytes = await self.signer.w3.eth.call({"to": token, "data": data})
+        raw_bytes = await self.signer.w3.eth.call({
+            "to": Web3.to_checksum_address(token),
+            "data": data,
+        })
         raw_hex = raw_bytes.hex() if hasattr(raw_bytes, "hex") else str(raw_bytes)
         raw_int = int(raw_hex, 16) if raw_hex not in {"0x", ""} else 0
         return raw_to_decimal(raw_int, decimals)
@@ -634,6 +648,7 @@ class Engine:
                 pass
             self._tick_event.clear()
             try:
+                self._check_unattended_limits()
                 await self._tick()
             except Exception as e:
                 log.error("engine.tick_failed", error=str(e))
@@ -652,6 +667,7 @@ class Engine:
 
         # 3. Risk evaluation
         risk_events = self.risk.evaluate(self.market_state, strategy_inventory, metrics)
+        risk_events = self._confirm_drawdown_events(risk_events)
         if risk_events and not self.balances_loaded:
             gated_rules = {"realized_loss", "max_drawdown"}
             gated = [ev for ev in risk_events if ev.rule_name in gated_rules]
@@ -672,6 +688,18 @@ class Engine:
             await self._handle_risk_events(risk_events)
 
         if self.paused_all or self.soft_paused_all or self._stopped:
+            return
+
+        if self._safe_exit_requested:
+            await self._flatten_erc20_inventory()
+            if not self._has_tradable_erc20_inventory():
+                log.warning("engine.safe_exit_complete", reason=self._safe_exit_reason)
+                self._report(
+                    event="safe_exit_complete",
+                    category="safety",
+                    reason=self._safe_exit_reason,
+                )
+                self.stop()
             return
 
         # 4. Run each enabled, unpaused strategy
@@ -715,6 +743,20 @@ class Engine:
 
         state = self.inventory_tracker.get(order.market)
         if order.side == Side.BUY:
+            if self._buy_block_reason() is not None:
+                reason = self._buy_block_reason()
+                log.warning(
+                    "engine.buy_blocked",
+                    market=order.market.value, coid=order.client_order_id, reason=reason,
+                )
+                self._report(
+                    event="buy_blocked",
+                    category="safety",
+                    market=order.market.value,
+                    client_order_id=order.client_order_id,
+                    reason=reason,
+                )
+                return False
             if order.price is None:
                 return True
             token = self.settings.quote_token(order.market).lower()
@@ -787,6 +829,95 @@ class Engine:
             last_successful_tx_ts=self.last_successful_tx_ts,
             ws_last_message_ts=self.ws.last_message_ts,
         )
+
+    def _confirm_drawdown_events(self, events: list[RiskEvent]) -> list[RiskEvent]:
+        drawdown_events = [ev for ev in events if ev.rule_name == "max_drawdown"]
+        if not drawdown_events:
+            self._drawdown_breach_count = 0
+            return events
+        self._drawdown_breach_count += 1
+        required = int(self.unattended_config.get("drawdown_confirmations", 3))
+        if self._drawdown_breach_count >= required:
+            return events
+        for ev in drawdown_events:
+            log.warning(
+                "risk.drawdown_pending_confirmation",
+                count=self._drawdown_breach_count, required=required, reason=ev.reason,
+            )
+        return [ev for ev in events if ev.rule_name != "max_drawdown"]
+
+    def _check_unattended_limits(self) -> None:
+        if self._safe_exit_requested:
+            return
+        max_runtime_sec = float(self.unattended_config.get("max_runtime_sec", 0))
+        if max_runtime_sec > 0 and time.time() - self._started_ts >= max_runtime_sec:
+            self._request_safe_exit("max_runtime_reached")
+            return
+        max_orders = int(self.unattended_config.get("max_submitted_orders", 0))
+        if max_orders > 0 and self._submitted_order_count >= max_orders:
+            self._request_safe_exit("max_submitted_orders_reached")
+
+    def _request_safe_exit(self, reason: str) -> None:
+        if self._safe_exit_requested:
+            return
+        self._safe_exit_requested = True
+        self._safe_exit_reason = reason
+        log.warning("engine.safe_exit_requested", reason=reason)
+        self._report(event="safe_exit_requested", category="safety", reason=reason)
+        self._tick_event.set()
+
+    def request_safe_exit(self, reason: str) -> None:
+        self._request_safe_exit(reason)
+
+    def _buy_block_reason(self) -> str | None:
+        if self._safe_exit_requested:
+            return self._safe_exit_reason or "safe_exit_requested"
+        native_floor = Decimal(str(self.unattended_config.get("min_native_somi", "0")))
+        native_state = self.inventory_tracker.states.get(MarketSymbol.SOMI_USDSO)
+        if native_floor > 0 and native_state and native_state.wallet_base < native_floor:
+            return f"native_somi_below_floor:{native_state.wallet_base}<{native_floor}"
+        quote_floor = Decimal(str(self.unattended_config.get("min_liquid_usdso", "0")))
+        wallet_quote = max(
+            (state.wallet_quote for state in self.inventory_tracker.states.values()),
+            default=Decimal(0),
+        )
+        if quote_floor > 0 and wallet_quote < quote_floor:
+            return f"liquid_usdso_below_floor:{wallet_quote}<{quote_floor}"
+        return None
+
+    def _has_tradable_erc20_inventory(self) -> bool:
+        for market, state in self.inventory_tracker.states.items():
+            if MARKETS[market].is_base_native:
+                continue
+            if ensure_min_quantity(state.free_base, market) is not None:
+                return True
+        return False
+
+    async def _flatten_erc20_inventory(self) -> None:
+        for market, state in self.inventory_tracker.states.items():
+            if MARKETS[market].is_base_native:
+                continue
+            ms = self.market_state.get(market)
+            if ms is None or ms.best_bid is None or ms.bid_depth_usd <= 0:
+                continue
+            qty = round_to_lot(state.free_base, market, direction="down")
+            qty = ensure_min_quantity(qty, market)
+            if qty is None:
+                continue
+            price = round_to_tick(ms.best_bid * Decimal("0.9995"), market, direction="down")
+            await self._place_order(
+                "safe_exit",
+                OrderIntent(
+                    market=market,
+                    side=Side.SELL,
+                    order_type=OrderType.IOC,
+                    quantity=qty,
+                    price=price,
+                    funding=FundingSource.WALLET,
+                    client_order_id=f"safe_exit_{market.value}_{int(time.time())}",
+                    reason=f"safe exit: {self._safe_exit_reason}",
+                ),
+            )
 
     async def _handle_risk_events(self, events: list[RiskEvent]) -> None:
         for ev in events:
@@ -964,6 +1095,7 @@ class Engine:
         log.info("engine.order_submitted",
                  strategy=strategy_name, coid=order.client_order_id,
                  tx_hash=tx_hash, market=order.market.value, side=order.side.value)
+        self._submitted_order_count += 1
         self._report(
             event="order_submitted",
             category="order",
@@ -1129,8 +1261,43 @@ class Engine:
             )
             return approval_key, required_amount
 
+        spender = self.settings.pool_address(market)
+        try:
+            allowance = await self._wallet_allowance(token, spender)
+        except Exception as e:
+            allowance = Decimal(0)
+            log.warning(
+                "engine.allowance_fetch_failed",
+                market=market.value, currency=currency, error=str(e),
+            )
+            self._report(
+                event="allowance_fetch_failed",
+                category="approval",
+                market=market.value,
+                currency=currency,
+                error=str(e),
+            )
+        if allowance >= required_amount:
+            self._submitted_approvals[approval_key] = allowance
+            log.info(
+                "engine.approval_skipped_onchain",
+                market=market.value, currency=currency, allowance=str(allowance),
+            )
+            self._report(
+                event="approval_skipped_onchain",
+                category="approval",
+                market=market.value,
+                currency=currency,
+                allowance=str(allowance),
+                required_amount=str(required_amount),
+            )
+            return approval_key, required_amount
+
+        approve_amount = required_amount
+        if self.approval_config.get("mode", "exact") == "max":
+            approve_amount = Decimal(2**256 - 1)
         prep = await self.rest.prepare_vault_approve(
-            market.value, self.signer.address, currency, amount,
+            market.value, self.signer.address, currency, str(approve_amount),
         )
         if prep is None:
             log.info("engine.approval_skipped_native", market=market.value, currency=currency)
@@ -1162,7 +1329,7 @@ class Engine:
                 block_number=receipt.get("blockNumber"),
             )
             if int(receipt.get("status", 0)) == 1:
-                self._submitted_approvals[approval_key] = max(cached_amount, required_amount)
+                self._submitted_approvals[approval_key] = max(cached_amount, approve_amount)
                 return approval_key, required_amount
             else:
                 log.warning(
@@ -1189,6 +1356,14 @@ class Engine:
                 error=str(e),
             )
         return None, Decimal(0)
+
+    async def _wallet_allowance(self, token: str, spender: str) -> Decimal:
+        owner_arg = self.signer.address.lower().removeprefix("0x").rjust(64, "0")
+        spender_arg = spender.lower().removeprefix("0x").rjust(64, "0")
+        data = "0xdd62ed3e" + owner_arg + spender_arg
+        raw_bytes = await self.signer.w3.eth.call({"to": token, "data": data})
+        raw_hex = raw_bytes.hex() if hasattr(raw_bytes, "hex") else str(raw_bytes)
+        return Decimal(int(raw_hex, 16) if raw_hex not in {"0x", ""} else 0)
 
     def _consume_cached_approval(self, approval_key: tuple[str, str], amount: Decimal) -> None:
         cached_amount = self._submitted_approvals.get(approval_key, Decimal(0))
