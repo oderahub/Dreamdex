@@ -924,6 +924,42 @@ class TestUnattendedSafeguards:
         assert engine._confirm_drawdown_events([event]) == []
         assert engine._confirm_drawdown_events([event]) == [event]
 
+    def test_drawdown_pending_blocks_new_buys(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        engine._drawdown_pending = True
+        engine.inventory_tracker.set_initial_balances(
+            MarketSymbol.SOMI_USDSO,
+            wallet_base=Decimal("10"), wallet_quote=Decimal("50"),
+            vault_base=Decimal("0"), vault_quote=Decimal("0"),
+        )
+        signal = TradingSignal(action=SignalAction.PLACE, order=OrderIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            side=Side.BUY,
+            order_type=OrderType.IOC,
+            quantity=Decimal("1"),
+            price=Decimal("0.5"),
+            funding=FundingSource.WALLET,
+            client_order_id="drawdown-pending",
+        ))
+
+        assert engine._reserve_tick_balance(signal, {}, {}) is False
+
+    @pytest.mark.asyncio
+    async def test_max_drawdown_requests_flatten_without_stopping_worker(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        event = RiskEvent(
+            rule_name="max_drawdown", action=RiskAction.KILL_SWITCH,
+            severity=Severity.CRITICAL, reason="drawdown threshold",
+        )
+
+        await engine._handle_risk_events([event])
+
+        assert engine.paused_all is True
+        assert engine._safe_exit_requested is True
+        assert engine._safe_exit_reason == "max_drawdown"
+        assert engine._safe_exit_stop_when_flat is False
+        assert engine._stopped is False
+
     def test_runtime_limit_requests_safe_exit(self, fake_components):
         engine, _, _, _, _ = fake_components
         engine.unattended_config = {"max_runtime_sec": 1}

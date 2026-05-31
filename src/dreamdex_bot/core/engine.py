@@ -89,7 +89,10 @@ class Engine:
         self._submitted_order_count = 0
         self._safe_exit_requested = False
         self._safe_exit_reason: str | None = None
+        self._safe_exit_stop_when_flat = True
+        self._safe_exit_complete_reported = False
         self._drawdown_breach_count = 0
+        self._drawdown_pending = False
 
     # ────────────────────────────────────────────────────────────────
     # Setup
@@ -687,19 +690,22 @@ class Engine:
         if risk_events:
             await self._handle_risk_events(risk_events)
 
-        if self.paused_all or self.soft_paused_all or self._stopped:
-            return
-
         if self._safe_exit_requested:
             await self._flatten_erc20_inventory()
             if not self._has_tradable_erc20_inventory():
-                log.warning("engine.safe_exit_complete", reason=self._safe_exit_reason)
-                self._report(
-                    event="safe_exit_complete",
-                    category="safety",
-                    reason=self._safe_exit_reason,
-                )
-                self.stop()
+                if not self._safe_exit_complete_reported:
+                    log.warning("engine.safe_exit_complete", reason=self._safe_exit_reason)
+                    self._report(
+                        event="safe_exit_complete",
+                        category="safety",
+                        reason=self._safe_exit_reason,
+                    )
+                    self._safe_exit_complete_reported = True
+                if self._safe_exit_stop_when_flat:
+                    self.stop()
+            return
+
+        if self.paused_all or self.soft_paused_all or self._stopped:
             return
 
         # 4. Run each enabled, unpaused strategy
@@ -835,7 +841,9 @@ class Engine:
         drawdown_events = [ev for ev in events if ev.rule_name == "max_drawdown"]
         if not drawdown_events:
             self._drawdown_breach_count = 0
+            self._drawdown_pending = False
             return events
+        self._drawdown_pending = True
         self._drawdown_breach_count += 1
         required = int(self.unattended_config.get("drawdown_confirmations", 3))
         if self._drawdown_breach_count >= required:
@@ -858,11 +866,13 @@ class Engine:
         if max_orders > 0 and self._submitted_order_count >= max_orders:
             self._request_safe_exit("max_submitted_orders_reached")
 
-    def _request_safe_exit(self, reason: str) -> None:
+    def _request_safe_exit(self, reason: str, *, stop_when_flat: bool = True) -> None:
         if self._safe_exit_requested:
             return
         self._safe_exit_requested = True
         self._safe_exit_reason = reason
+        self._safe_exit_stop_when_flat = stop_when_flat
+        self._safe_exit_complete_reported = False
         log.warning("engine.safe_exit_requested", reason=reason)
         self._report(event="safe_exit_requested", category="safety", reason=reason)
         self._tick_event.set()
@@ -873,6 +883,8 @@ class Engine:
     def _buy_block_reason(self, projected_quote_spend: Decimal = Decimal(0)) -> str | None:
         if self._safe_exit_requested:
             return self._safe_exit_reason or "safe_exit_requested"
+        if self._drawdown_pending:
+            return "drawdown_pending_confirmation"
         native_floor = Decimal(str(self.unattended_config.get("min_native_somi", "0")))
         native_state = self.inventory_tracker.states.get(MarketSymbol.SOMI_USDSO)
         if native_floor > 0 and native_state and native_state.wallet_base < native_floor:
@@ -942,7 +954,10 @@ class Engine:
                 # vault recovery is left for manual review post-shutdown.
                 self.paused_all = True
                 await self._cancel_all_orders()
-                self._stopped = True
+                if ev.rule_name == "max_drawdown":
+                    self._request_safe_exit("max_drawdown", stop_when_flat=False)
+                else:
+                    self._stopped = True
             elif ev.action == RiskAction.PAUSE_ALL:
                 # OpenOrdersCapRule and a few others want to back-pressure for
                 # one tick only. We identify "soft" pauses by rule_name. Anything
