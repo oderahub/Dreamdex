@@ -43,7 +43,7 @@ strategies:
     cycle_interval_sec: 60.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      WETH:USDso: "7.00"
+      WETH:USDso: "9.00"
     max_inventory_imbalance_usd: 15.00
     max_spread_bps: 5.0
     min_side_depth_usd: 100.00
