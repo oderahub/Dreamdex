@@ -3,7 +3,7 @@
 # bump aggressiveness once we've confirmed mainnet behavior matches testnet.
 
 bot:
-  starting_capital_usd: 50.00
+  starting_capital_usd: 37.40
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
@@ -40,12 +40,10 @@ strategies:
     enabled: true
     markets:
       - WETH:USDso
-      - WBTC:USDso
-    cycle_interval_sec: 15.0
+    cycle_interval_sec: 60.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      WETH:USDso: "4.00"
-      WBTC:USDso: "12.00"
+      WETH:USDso: "2.00"
     max_inventory_imbalance_usd: 15.00
     max_spread_bps: 5.0
     min_side_depth_usd: 100.00
