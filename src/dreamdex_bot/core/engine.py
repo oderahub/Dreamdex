@@ -93,6 +93,7 @@ class Engine:
         self._safe_exit_complete_reported = False
         self._drawdown_breach_count = 0
         self._drawdown_pending = False
+        self._max_drawdown_handled = False
 
     # ────────────────────────────────────────────────────────────────
     # Setup
@@ -839,6 +840,8 @@ class Engine:
 
     def _confirm_drawdown_events(self, events: list[RiskEvent]) -> list[RiskEvent]:
         drawdown_events = [ev for ev in events if ev.rule_name == "max_drawdown"]
+        if self._max_drawdown_handled:
+            return [ev for ev in events if ev.rule_name != "max_drawdown"]
         if not drawdown_events:
             self._drawdown_breach_count = 0
             self._drawdown_pending = False
@@ -955,6 +958,7 @@ class Engine:
                 self.paused_all = True
                 await self._cancel_all_orders()
                 if ev.rule_name == "max_drawdown":
+                    self._max_drawdown_handled = True
                     self._request_safe_exit("max_drawdown", stop_when_flat=False)
                 else:
                     self._stopped = True

@@ -960,6 +960,19 @@ class TestUnattendedSafeguards:
         assert engine._safe_exit_stop_when_flat is False
         assert engine._stopped is False
 
+    @pytest.mark.asyncio
+    async def test_handled_max_drawdown_is_not_dispatched_again(self, fake_components):
+        engine, _, _, _, _ = fake_components
+        event = RiskEvent(
+            rule_name="max_drawdown", action=RiskAction.KILL_SWITCH,
+            severity=Severity.CRITICAL, reason="drawdown threshold",
+        )
+
+        await engine._handle_risk_events([event])
+
+        assert engine._max_drawdown_handled is True
+        assert engine._confirm_drawdown_events([event]) == []
+
     def test_runtime_limit_requests_safe_exit(self, fake_components):
         engine, _, _, _, _ = fake_components
         engine.unattended_config = {"max_runtime_sec": 1}
