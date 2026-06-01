@@ -407,7 +407,7 @@ class TestYieldMaker:
             "requote_min_interval_sec": 0,
         })
         ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
-        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0.0040")
 
         signals = await strat.generate_signals(
             {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
@@ -429,7 +429,7 @@ class TestYieldMaker:
             "improve_ticks": 1,
             "requote_min_interval_sec": 0,
         })
-        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0.0040")
         first = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
         await strat.generate_signals(
             {MarketSymbol.WETH_USDSO: first}, {MarketSymbol.WETH_USDSO: inv},
@@ -441,6 +441,75 @@ class TestYieldMaker:
 
         assert strat._paper_base_delta == Decimal("0.0040")
         assert strat._paper_quote_delta == Decimal("-7.916400")
+
+    @pytest.mark.asyncio
+    async def test_weth_paper_mode_only_quotes_funded_sides(self):
+        strat = YieldMaker({
+            "paper_mode": True,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "8.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="0", base="0")
+
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert strat._our_bid is None
+        assert strat._our_ask is None
+
+    @pytest.mark.asyncio
+    async def test_weth_paper_mode_uses_fill_deltas_as_simulated_balances(self):
+        strat = YieldMaker({
+            "paper_mode": True,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "8.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="0", base="0.0040")
+        first = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: first}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        crossed = make_market_state(MarketSymbol.WETH_USDSO, "1979.60", "1979.80")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: crossed}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert strat._paper_base_delta == Decimal("-0.0040")
+        assert strat._paper_quote_delta == Decimal("7.918400")
+        assert strat._our_bid is not None
+        assert strat._our_ask is None
+
+    @pytest.mark.asyncio
+    async def test_weth_paper_mode_clears_quote_when_refreshed_balance_cannot_fund_it(self):
+        strat = YieldMaker({
+            "paper_mode": True,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "8.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        funded = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: funded},
+        )
+        assert strat._our_bid is not None
+
+        empty = make_inventory(MarketSymbol.WETH_USDSO, quote="0", base="0")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: empty},
+        )
+
+        assert strat._our_bid is None
 
     def test_native_base_reserve_is_excluded_from_inventory_skew(self):
         strat = YieldMaker({

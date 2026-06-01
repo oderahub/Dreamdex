@@ -140,11 +140,11 @@ class YieldMaker(TradingStrategy):
         if self.paper_mode:
             changed = self._paper_manage_quote(
                 current=self._our_bid, target_price=bid_price, target_qty=bid_qty,
-                side=Side.BUY, mid=ms.mid,
+                side=Side.BUY, mid=ms.mid, inv=inv,
             )
             changed = self._paper_manage_quote(
                 current=self._our_ask, target_price=ask_price, target_qty=ask_qty,
-                side=Side.SELL, mid=ms.mid,
+                side=Side.SELL, mid=ms.mid, inv=inv,
             ) or changed
             if changed:
                 self._last_requote_ts = time.time()
@@ -178,14 +178,30 @@ class YieldMaker(TradingStrategy):
         target_qty: Decimal,
         side: Side,
         mid: Decimal,
+        inv: OwnInventory,
     ) -> bool:
+        if side == Side.BUY:
+            available_qty = self._paper_quote_balance(inv) / target_price
+        else:
+            available_qty = self._inventory_base_balance(inv)
+        target_qty = min(target_qty, round_to_lot(available_qty, self.market, direction="down"))
         qty_checked = ensure_min_quantity(target_qty, self.market)
         if qty_checked is None or qty_checked <= 0:
-            return False
+            if current is None:
+                return False
+            self._clear_paper_quote(side)
+            log.info(
+                "yield_maker.paper_cancel",
+                market=self.market.value,
+                side=side.value,
+                coid=current["coid"],
+                reason="insufficient_balance",
+            )
+            return True
 
         if current is not None:
             drift_bps = abs(target_price - current["price"]) / mid * Decimal("10000")
-            if drift_bps <= self.requote_threshold_bps:
+            if drift_bps <= self.requote_threshold_bps and current["qty"] == qty_checked:
                 return False
             log.info(
                 "yield_maker.paper_cancel",
@@ -206,6 +222,12 @@ class YieldMaker(TradingStrategy):
             price=str(target_price),
         )
         return True
+
+    def _clear_paper_quote(self, side: Side) -> None:
+        if side == Side.BUY:
+            self._our_bid = None
+        else:
+            self._our_ask = None
 
     def _apply_paper_fills(self, ms: MarketState) -> None:
         assert ms.best_bid is not None and ms.best_ask is not None
@@ -292,10 +314,16 @@ class YieldMaker(TradingStrategy):
         )
 
     def _inventory_base_balance(self, inv: OwnInventory) -> Decimal:
+        base_balance = inv.base_balance
+        if self.paper_mode:
+            base_balance += self._paper_base_delta
         if not MARKETS[self.market].is_base_native:
-            return inv.base_balance
-        reserved = min(inv.base_balance, self.native_base_reserve)
-        return max(Decimal("0"), inv.base_balance - reserved)
+            return max(Decimal("0"), base_balance)
+        reserved = min(base_balance, self.native_base_reserve)
+        return max(Decimal("0"), base_balance - reserved)
+
+    def _paper_quote_balance(self, inv: OwnInventory) -> Decimal:
+        return max(Decimal("0"), inv.quote_balance + self._paper_quote_delta)
 
     def _record_placement(self, side: Side, order: OrderIntent) -> None:
         """Fix for gap #3: track that we have a resting quote on this side
