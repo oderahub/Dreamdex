@@ -30,7 +30,7 @@ wallet_approvals:
 
 unattended:
   min_native_somi: "3.00"
-  min_liquid_usdso: "25.00"
+  min_liquid_usdso: "10.00"
   max_runtime_sec: 72000
   max_submitted_orders: 2000
   drawdown_confirmations: 10
