@@ -7,6 +7,7 @@ bot:
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
+    - USDC.e:USDso
     - WBTC:USDso
 
 bootstrap:
@@ -30,20 +31,22 @@ wallet_approvals:
 
 unattended:
   min_native_somi: "3.00"
-  min_liquid_usdso: "10.00"
+  min_liquid_usdso: "3.00"
   max_runtime_sec: 72000
-  max_submitted_orders: 2000
+  max_submitted_orders: 20000
   drawdown_confirmations: 10
 
 strategies:
   volume_mill:
     enabled: true
     markets:
+      - USDC.e:USDso
       - WETH:USDso
-    cycle_interval_sec: 60.0
+    cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      WETH:USDso: "19.50"
+      USDC.e:USDso: "18.00"
+      WETH:USDso: "10.00"
     max_inventory_imbalance_usd: 22.00
     max_spread_bps: 5.0
     min_side_depth_usd: 100.00
