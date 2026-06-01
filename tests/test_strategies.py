@@ -99,6 +99,24 @@ class TestVolumeMill:
         assert signals[0].order.price == Decimal("0.4997")  # crosses below best bid
 
     @pytest.mark.asyncio
+    async def test_flattens_residual_weth_after_restart_before_fresh_buy(self):
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "size_per_cycle_usd": "9.00",
+            "max_inventory_imbalance_usd": "15.00",
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="26.30", base="0.0045")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert len(signals) == 1
+        assert signals[0].order.side == Side.SELL
+        assert signals[0].order.quantity == Decimal("0.0045")
+
+    @pytest.mark.asyncio
     async def test_does_not_sell_reserved_native_base(self):
         strat = VolumeMill({
             "market": "SOMI:USDso",

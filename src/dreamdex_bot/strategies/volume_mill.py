@@ -111,6 +111,14 @@ class VolumeMill(TradingStrategy):
         if tradable_base <= 0:
             self._clear_entry()
 
+        # A restart can occur after a buy but before the matching sell. The
+        # in-memory action state is then lost, so flatten discovered base
+        # inventory before starting a fresh cycle.
+        if self._last_action is None and tradable_base > 0:
+            sell = self._sell_all_signal(ms, tradable_base)
+            if sell:
+                return sell
+
         # If we hold base above the imbalance threshold, sell to flatten.
         max_base_units = self.max_inventory_imbalance
         if self.max_inventory_imbalance_usd > 0:
