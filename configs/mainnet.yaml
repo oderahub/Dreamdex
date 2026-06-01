@@ -57,14 +57,21 @@ strategies:
       SOMI:USDso: "10.00"
 
   yield_maker:
-    enabled: false
-    disabled_reason: "Day 1 disabled pending paper trading of maker quotes, cancel IDs, and inventory parameters."
-    target_base_value_usd: 12.50
-    quote_size_usd: 2.00
-    min_half_spread_bps: 30      # Wider on mainnet Day 1 — easier to confirm fills are real
+    # Observe WETH maker opportunities without placing or cancelling orders.
+    # Keep VolumeMill active until paper fills and requote frequency are reviewed.
+    enabled: true
+    paper_mode: true
+    market: WETH:USDso
+    quote_mode: top_of_book
+    improve_ticks: 1
+    target_base_value_usd: 8.00
+    quote_size_usd: 8.00
+    min_book_spread_bps: 1.80
+    min_side_depth_usd: 300.00
+    min_half_spread_bps: 1
     gamma: 0.5
     k_vol: 2.0
-    requote_threshold_bps: 5
+    requote_threshold_bps: 1.5
     requote_min_interval_sec: 3.0
     vol_window: 60
     native_base_reserve_by_market:

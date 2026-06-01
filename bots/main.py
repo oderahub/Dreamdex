@@ -28,7 +28,7 @@ from typing import Any
 
 import yaml
 
-from dreamdex_bot.config import MarketSymbol, Network, load_settings
+from dreamdex_bot.config import MarketSymbol, load_settings
 from dreamdex_bot.core.engine import Engine
 from dreamdex_bot.core.rest_client import RestClient
 from dreamdex_bot.core.risk_manager import RiskManager
@@ -200,11 +200,13 @@ async def main(config_path: str | None) -> None:
                                  "Set strategies.volume_mill.markets to available markets.")
     ym_cfg = cfg["strategies"].get("yield_maker", {})
     if settings.enable_yield_maker and ym_cfg.get("enabled", True):
-        if MarketSymbol.SOMI_USDSO in markets_to_watch:
+        ym_market = MarketSymbol(ym_cfg.get("market", MarketSymbol.SOMI_USDSO.value))
+        if ym_market in markets_to_watch:
             strategies.append(YieldMaker(ym_cfg))
         else:
             log.warning("bot.yield_maker_skipped",
-                        note="SOMI:USDso not available on this network.")
+                        market=ym_market.value,
+                        note="Configured maker market is not available on this network.")
     else:
         log.info(
             "bot.yield_maker_disabled",

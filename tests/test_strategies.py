@@ -378,6 +378,52 @@ class TestVolumeMill:
 # ════════════════════════════════════════════════════════════════════
 
 class TestYieldMaker:
+    @pytest.mark.asyncio
+    async def test_weth_paper_mode_tracks_top_of_book_quotes_without_emitting_signals(self):
+        strat = YieldMaker({
+            "paper_mode": True,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "8.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert signals == []
+        assert strat._our_bid is not None
+        assert strat._our_bid["price"] == Decimal("1979.15")
+        assert strat._our_ask is not None
+        assert strat._our_ask["price"] == Decimal("1979.54")
+
+    @pytest.mark.asyncio
+    async def test_weth_paper_mode_records_crossed_bid_fill(self):
+        strat = YieldMaker({
+            "paper_mode": True,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "8.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="35", base="0")
+        first = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: first}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        crossed = make_market_state(MarketSymbol.WETH_USDSO, "1978.90", "1979.10")
+        await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: crossed}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert strat._paper_base_delta == Decimal("0.0040")
+        assert strat._paper_quote_delta == Decimal("-7.916400")
+
     def test_native_base_reserve_is_excluded_from_inventory_skew(self):
         strat = YieldMaker({
             "target_base_value_usd": "12.50",
@@ -436,7 +482,7 @@ class TestYieldMaker:
         })
         ms = make_market_state(MarketSymbol.SOMI_USDSO, "0.499", "0.501")
         inv = make_inventory(MarketSymbol.SOMI_USDSO, quote="100", base="25")
-        first = await strat.generate_signals(
+        await strat.generate_signals(
             {MarketSymbol.SOMI_USDSO: ms}, {MarketSymbol.SOMI_USDSO: inv},
         )
         # Force time forward past interval debounce so the interval check passes

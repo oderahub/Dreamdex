@@ -1,6 +1,6 @@
 """
-Yield Maker — SOMI:USDso vault-funded PostOnly with Avellaneda-Stoikov-style
-reservation price.
+Yield Maker - configurable vault-funded PostOnly quoting with an optional
+read-only paper mode.
 
 Fix for gap #3: this version actually tracks placed quotes. The strategy
 assigns `_our_bid`/`_our_ask` immediately when it emits a PLACE signal, so
@@ -40,18 +40,23 @@ log = get_logger(__name__)
 
 
 class YieldMaker(TradingStrategy):
-    """PostOnly quoting on SOMI:USDso with inventory-skewed reservation price."""
+    """PostOnly quoting with inventory-skewed reservation price."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(name="yield_maker", config=config)
-        self.market = MarketSymbol.SOMI_USDSO
+        self.market = MarketSymbol(config.get("market", MarketSymbol.SOMI_USDSO.value))
 
+        self.paper_mode = bool(config.get("paper_mode", False))
+        self.quote_mode = str(config.get("quote_mode", "reservation"))
+        self.improve_ticks = int(config.get("improve_ticks", 1))
         self.target_base_value_usd = Decimal(str(config.get("target_base_value_usd", "12.50")))
         self.quote_size_usd = Decimal(str(config.get("quote_size_usd", "2.00")))
         self.min_half_spread_bps = int(config.get("min_half_spread_bps", 25))
+        self.min_book_spread_bps = Decimal(str(config.get("min_book_spread_bps", "0")))
+        self.min_side_depth_usd = Decimal(str(config.get("min_side_depth_usd", "0")))
         self.gamma = float(config.get("gamma", 0.5))
         self.k_vol = float(config.get("k_vol", 2.0))
-        self.requote_threshold_bps = int(config.get("requote_threshold_bps", 5))
+        self.requote_threshold_bps = Decimal(str(config.get("requote_threshold_bps", "5")))
         self.requote_min_interval_sec = float(config.get("requote_min_interval_sec", 3.0))
         reserve_by_market = config.get("native_base_reserve_by_market", {})
         self.native_base_reserve = Decimal(str(
@@ -64,6 +69,8 @@ class YieldMaker(TradingStrategy):
         self._our_bid: dict[str, Any] | None = None
         self._our_ask: dict[str, Any] | None = None
         self._last_requote_ts: float = 0.0
+        self._paper_base_delta = Decimal("0")
+        self._paper_quote_delta = Decimal("0")
 
         self._mid_window: deque[Decimal] = deque(maxlen=int(config.get("vol_window", 60)))
 
@@ -74,10 +81,24 @@ class YieldMaker(TradingStrategy):
     ) -> list[TradingSignal]:
         ms = market_state.get(self.market)
         inv = inventory.get(self.market)
-        if ms is None or inv is None or ms.mid is None:
+        if (
+            ms is None or inv is None or ms.mid is None
+            or ms.best_bid is None or ms.best_ask is None
+        ):
             return []
 
         self._mid_window.append(ms.mid)
+        if self.paper_mode:
+            self._apply_paper_fills(ms)
+
+        book_spread_bps = (ms.best_ask - ms.best_bid) / ms.mid * Decimal("10000")
+        if book_spread_bps < self.min_book_spread_bps:
+            return []
+        if (
+            ms.bid_depth_usd < self.min_side_depth_usd
+            or ms.ask_depth_usd < self.min_side_depth_usd
+        ):
+            return []
 
         # Reservation price
         sigma = self._realized_vol()
@@ -91,12 +112,18 @@ class YieldMaker(TradingStrategy):
         vol_half = self.k_vol * sigma * float(ms.mid)
         half_spread = max(min_half, vol_half)
 
-        bid_price = round_to_tick(
-            Decimal(str(reservation_price - half_spread)), self.market, direction="down",
-        )
-        ask_price = round_to_tick(
-            Decimal(str(reservation_price + half_spread)), self.market, direction="up",
-        )
+        if self.quote_mode == "top_of_book":
+            tick = MARKETS[self.market].tick_size
+            improvement = tick * self.improve_ticks
+            bid_price = min(ms.best_bid + improvement, ms.best_ask - tick)
+            ask_price = max(ms.best_ask - improvement, ms.best_bid + tick)
+        else:
+            bid_price = round_to_tick(
+                Decimal(str(reservation_price - half_spread)), self.market, direction="down",
+            )
+            ask_price = round_to_tick(
+                Decimal(str(reservation_price + half_spread)), self.market, direction="up",
+            )
 
         # Don't requote if too recent
         if time.time() - self._last_requote_ts < self.requote_min_interval_sec:
@@ -109,6 +136,19 @@ class YieldMaker(TradingStrategy):
             return []
         bid_qty = round_to_lot(self.quote_size_usd / bid_price, self.market, direction="down")
         ask_qty = round_to_lot(self.quote_size_usd / ask_price, self.market, direction="down")
+
+        if self.paper_mode:
+            changed = self._paper_manage_quote(
+                current=self._our_bid, target_price=bid_price, target_qty=bid_qty,
+                side=Side.BUY, mid=ms.mid,
+            )
+            changed = self._paper_manage_quote(
+                current=self._our_ask, target_price=ask_price, target_qty=ask_qty,
+                side=Side.SELL, mid=ms.mid,
+            ) or changed
+            if changed:
+                self._last_requote_ts = time.time()
+            return []
 
         # Bid
         signals.extend(self._manage_quote(
@@ -130,6 +170,71 @@ class YieldMaker(TradingStrategy):
                 inventory_skew_usd=str(q_delta_usd), sigma=sigma,
             )
         return signals
+
+    def _paper_manage_quote(
+        self,
+        current: dict[str, Any] | None,
+        target_price: Decimal,
+        target_qty: Decimal,
+        side: Side,
+        mid: Decimal,
+    ) -> bool:
+        qty_checked = ensure_min_quantity(target_qty, self.market)
+        if qty_checked is None or qty_checked <= 0:
+            return False
+
+        if current is not None:
+            drift_bps = abs(target_price - current["price"]) / mid * Decimal("10000")
+            if drift_bps <= self.requote_threshold_bps:
+                return False
+            log.info(
+                "yield_maker.paper_cancel",
+                market=self.market.value,
+                side=side.value,
+                coid=current["coid"],
+                drift_bps=str(drift_bps),
+            )
+
+        place = self._place(side, qty_checked, target_price)
+        self._record_placement(side, place.order)
+        log.info(
+            "yield_maker.paper_quote",
+            market=self.market.value,
+            side=side.value,
+            coid=place.order.client_order_id,
+            qty=str(qty_checked),
+            price=str(target_price),
+        )
+        return True
+
+    def _apply_paper_fills(self, ms: MarketState) -> None:
+        assert ms.best_bid is not None and ms.best_ask is not None
+        if self._our_bid and self._our_bid["price"] >= ms.best_ask:
+            self._paper_fill(Side.BUY, self._our_bid, ms.best_ask)
+        if self._our_ask and self._our_ask["price"] <= ms.best_bid:
+            self._paper_fill(Side.SELL, self._our_ask, ms.best_bid)
+
+    def _paper_fill(self, side: Side, quote: dict[str, Any], fill_price: Decimal) -> None:
+        qty = quote["qty"]
+        quote_value = qty * fill_price
+        if side == Side.BUY:
+            self._paper_base_delta += qty
+            self._paper_quote_delta -= quote_value
+            self._our_bid = None
+        else:
+            self._paper_base_delta -= qty
+            self._paper_quote_delta += quote_value
+            self._our_ask = None
+        log.info(
+            "yield_maker.paper_fill",
+            market=self.market.value,
+            side=side.value,
+            coid=quote["coid"],
+            qty=str(qty),
+            price=str(fill_price),
+            paper_base_delta=str(self._paper_base_delta),
+            paper_quote_delta=str(self._paper_quote_delta),
+        )
 
     def _manage_quote(
         self,
