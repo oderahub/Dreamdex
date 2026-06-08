@@ -298,8 +298,8 @@ class RestClient:
         """
         if not markets:
             return {}
-
-        async def _fetch_one(symbol: str) -> tuple[str, dict[str, Any] | None]:
+        out: dict[str, Any] = {}
+        for symbol in markets:
             try:
                 data = await self._request(
                     "GET", f"/v0/markets/{symbol}/vault/balance",
@@ -307,18 +307,8 @@ class RestClient:
                 )
             except Exception as e:
                 log.warning("rest.vault_balance_unavailable", market=symbol, error=str(e))
-                return symbol, None
-            return symbol, data
-
-        # Layer 3 (re-added with F9 nonce fix): fan out per-market REST calls
-        # in parallel. The nonce race that previously surfaced is now caught
-        # by signer's resync_from_chain on "nonce too low".
-        results = await asyncio.gather(*(_fetch_one(s) for s in markets))
-
-        out: dict[str, Any] = {}
-        for symbol, data in results:
-            if data is None:
                 continue
+
             entry = {"walletBase": "0", "walletQuote": "0", "vaultBase": "0", "vaultQuote": "0"}
             for bal in data.get("balances", []):
                 currency = str(bal.get("currency", ""))
