@@ -136,6 +136,23 @@ class NonceManager:
                 self._next_nonce = nonce
                 log.info("nonce.rolled_back", nonce=nonce)
 
+    async def resync_from_chain(self) -> int:
+        """Re-read pending nonce from chain. Use after 'nonce too low' errors.
+
+        The decrement-rollback in mark_aborted is unsafe when the chain has
+        already consumed the nonce (which is exactly what "nonce too low"
+        means). This re-queries `pending` so the next acquire() lands on
+        whatever the chain expects next.
+        """
+        async with self._lock:
+            latest = await self.w3.eth.get_transaction_count(
+                self.account.address, "pending"
+            )
+            self._pending.clear()
+            self._next_nonce = latest
+            log.warning("nonce.resynced_from_chain", nonce=latest)
+            return latest
+
     async def reconcile_loop(self, interval: float = 5.0) -> None:
         """Background task: detect and replace stuck txs."""
         while not self._stopped:
@@ -246,8 +263,15 @@ class Signer:
             log.debug("tx.submitted", nonce=nonce, tx_hash=tx_hash, to=to)
             return tx_hash
         except Exception as e:
-            await self.nonces.mark_aborted(nonce)
-            log.error("tx.send_failed", nonce=nonce, error=str(e))
+            err_str = str(e)
+            # F9 fix: when chain says "nonce too low", the nonce is consumed.
+            # Decrement-rollback would reuse it and fail again, looping the
+            # failed_tx_streak rule into pause_all. Re-sync from chain instead.
+            if "nonce too low" in err_str.lower():
+                await self.nonces.resync_from_chain()
+            else:
+                await self.nonces.mark_aborted(nonce)
+            log.error("tx.send_failed", nonce=nonce, error=err_str)
             raise
 
     async def simulate_order_tx(
