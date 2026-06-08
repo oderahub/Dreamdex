@@ -83,7 +83,9 @@ class Engine:
         self._stopped = False
         self._tick_event = asyncio.Event()
         self._last_balance_refresh_ts: float = 0.0
-        self._balance_refresh_min_interval_sec: float = 5.0
+        self._balance_refresh_min_interval_sec: float = float(
+            (unattended_config or {}).get("balance_refresh_min_interval_sec", 5.0)
+        )
         self._submitted_approvals: dict[tuple[str, str], Decimal] = {}
         self._started_ts = time.time()
         self._submitted_order_count = 0
@@ -367,29 +369,39 @@ class Engine:
                      "Strategies will idle on zero balances; drawdown/loss kill rules are gated.",
             )
 
-        for m in self.markets_to_watch:
+        async def _fetch_market_balances(m):
             spec = MARKETS[m]
-            try:
-                wallet_base = await self._wallet_token_balance(
+            wallet_base, wallet_quote = await asyncio.gather(
+                self._wallet_token_balance(
                     token=self.settings.base_token(m),
                     decimals=spec.base_decimals,
                     is_native=spec.is_base_native,
-                )
-                wallet_quote = await self._wallet_token_balance(
+                ),
+                self._wallet_token_balance(
                     token=self.settings.quote_token(m),
                     decimals=spec.quote_decimals,
                     is_native=False,
-                )
-                vault_base = Decimal(str(balances.get(spec.symbol.value, {}).get("vaultBase", "0")))
-                vault_quote = Decimal(str(balances.get(spec.symbol.value, {}).get("vaultQuote", "0")))
-                if wallet_base > 0 or wallet_quote > 0 or vault_base > 0 or vault_quote > 0:
-                    self.balances_loaded = True
-                self.inventory_tracker.set_initial_balances(
-                    m, wallet_base, wallet_quote, vault_base, vault_quote,
-                )
-            except Exception as e:
-                log.warning("engine.balance_fetch_failed", market=m.value, error=str(e),
+                ),
+            )
+            vault_base = Decimal(str(balances.get(spec.symbol.value, {}).get("vaultBase", "0")))
+            vault_quote = Decimal(str(balances.get(spec.symbol.value, {}).get("vaultQuote", "0")))
+            return m, wallet_base, wallet_quote, vault_base, vault_quote
+
+        results = await asyncio.gather(
+            *(_fetch_market_balances(m) for m in self.markets_to_watch),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, BaseException):
+                log.warning("engine.balance_fetch_failed", error=str(r),
                             note="Balances default to zero. Strategies relying on free balance will idle.")
+                continue
+            m, wallet_base, wallet_quote, vault_base, vault_quote = r
+            if wallet_base > 0 or wallet_quote > 0 or vault_base > 0 or vault_quote > 0:
+                self.balances_loaded = True
+            self.inventory_tracker.set_initial_balances(
+                m, wallet_base, wallet_quote, vault_base, vault_quote,
+            )
 
     async def _wallet_token_balance(self, token: str, decimals: int, is_native: bool) -> Decimal:
         if is_native:

@@ -35,6 +35,9 @@ unattended:
   max_runtime_sec: 72000
   max_submitted_orders: 20000
   drawdown_confirmations: 10
+  # Phase 2: bump from 5s to widen the per-tx critical path window.
+  # Each refresh fans out N markets in parallel (asyncio.gather).
+  balance_refresh_min_interval_sec: 15.0
 
 strategies:
   volume_mill:
