@@ -52,7 +52,9 @@ strategies:
       USDC.e:USDso: "45.00"
       WETH:USDso: "25.00"
     max_inventory_imbalance_usd: 60.00
-    max_spread_bps: 5.0
+    # Phase 2 Layer 3 (stable): captures USDC.e's bimodal 7-bps tail.
+    # Live sample showed 27% of cycles skipping at the 5 bps cap.
+    max_spread_bps: 8.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
     ioc_cross_bps: 5.0

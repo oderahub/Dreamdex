@@ -1035,10 +1035,21 @@ class Engine:
             elif signal.action == SignalAction.CANCEL and signal.cancel is not None:
                 await self._cancel_order(signal.cancel)
         except Exception as e:
-            self.failed_tx_streak += 1
-            log.error("engine.execute_failed",
-                      strategy=strategy_name, error=str(e),
-                      streak=self.failed_tx_streak)
+            err_str = str(e)
+            # F9 fix companion: "nonce too low" was already auto-recovered by
+            # signer.resync_from_chain. The next acquire() will land on the
+            # correct nonce. Don't count these toward failed_tx_streak — they
+            # are transient races under concurrent submission, not signs of a
+            # broken bot. Counting them would cause pause_all to trip during
+            # normal Layer-3-style parallel operation.
+            if "nonce too low" in err_str.lower():
+                log.warning("engine.transient_nonce_race",
+                            strategy=strategy_name, error=err_str)
+            else:
+                self.failed_tx_streak += 1
+                log.error("engine.execute_failed",
+                          strategy=strategy_name, error=err_str,
+                          streak=self.failed_tx_streak)
 
     async def _place_order(
         self,
