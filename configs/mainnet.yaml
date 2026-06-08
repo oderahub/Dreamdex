@@ -3,7 +3,7 @@
 # bump aggressiveness once we've confirmed mainnet behavior matches testnet.
 
 bot:
-  starting_capital_usd: 37.40
+  starting_capital_usd: 100.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
@@ -30,8 +30,8 @@ wallet_approvals:
   mode: max
 
 unattended:
-  min_native_somi: "3.00"
-  min_liquid_usdso: "3.00"
+  min_native_somi: "1.00"
+  min_liquid_usdso: "1.00"
   max_runtime_sec: 72000
   max_submitted_orders: 20000
   drawdown_confirmations: 10
@@ -45,9 +45,9 @@ strategies:
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      USDC.e:USDso: "18.00"
-      WETH:USDso: "10.00"
-    max_inventory_imbalance_usd: 22.00
+      USDC.e:USDso: "45.00"
+      WETH:USDso: "25.00"
+    max_inventory_imbalance_usd: 60.00
     max_spread_bps: 5.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
@@ -82,7 +82,7 @@ strategies:
 
 risk:
   realized_loss:
-    max_loss_usd: 10.00          # Tighter than testnet (20% vs 25%)
+    max_loss_usd: 90.00          # Phase 2: burn capital for volume milestones
   inventory_drift:
     enabled: false
     market: SOMI:USDso
@@ -98,4 +98,4 @@ risk:
   open_orders_cap:
     max_open: 6
   max_drawdown:
-    max_drawdown_pct: 25.0
+    max_drawdown_pct: 80.0
