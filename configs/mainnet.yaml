@@ -35,9 +35,10 @@ unattended:
   max_runtime_sec: 72000
   max_submitted_orders: 20000
   drawdown_confirmations: 10
-  # Phase 2: bump from 5s to widen the per-tx critical path window.
-  # Each refresh fans out N markets in parallel (asyncio.gather).
-  balance_refresh_min_interval_sec: 15.0
+  # Phase 2: matches the post-Layer-2 ~3s/tx cadence so the inventory
+  # tracker stays fresh and IOC sells don't simulate-fail on stale state.
+  # Parallel asyncio.gather makes refresh cheap (~1s for 4 markets x 2 tokens).
+  balance_refresh_min_interval_sec: 2.0
 
 strategies:
   volume_mill:
