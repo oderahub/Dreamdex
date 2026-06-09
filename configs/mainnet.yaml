@@ -49,7 +49,7 @@ strategies:
     enabled: true
     markets:
       - USDC.e:USDso
-    cycle_interval_sec: 25.0
+    cycle_interval_sec: 10.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       USDC.e:USDso: "65.00"
