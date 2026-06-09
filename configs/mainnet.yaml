@@ -46,10 +46,10 @@ unattended:
 
 strategies:
   volume_mill:
-    # Temporarily disabled while we test yield_maker live on USDC.e. Running both
-    # at once would trigger STP self-matching (default cancelTaker drops our IOC).
-    # Re-enable once we measure whether the yield accrual is meaningful.
-    enabled: false
+    # Re-enabled after the live yield_maker test failed to get filled at $5
+    # quotes — we couldn't beat the dominant maker's queue position at the
+    # 2-bps minimum spread. IOC on the same book is the proven volume path.
+    enabled: true
     markets:
       - USDC.e:USDso
     cycle_interval_sec: 10.0
@@ -71,16 +71,14 @@ strategies:
       SOMI:USDso: "10.00"
 
   yield_maker:
-    # Live test of the dreamDEX collateral-yield mechanism on USDC.e:USDso.
-    # The yield-algorithm doc (trading/common/yield-algorithm.md) confirms only
-    # POST_ONLY / GTC orders accrue yield, weighted by proximity to mid-price.
-    # USDC.e:USDso pins at ~$1.0000, so quoting at the BBO sits right at peak
-    # Gaussian weight with essentially zero adverse-selection (no drift).
-    # Funding is VAULT (required by POST_ONLY) — deposit first via
-    # tools/deposit_vault.py.
-    enabled: true
-    paper_mode: false
-    market: USDC.e:USDso
+    # Disabled — the live USDC.e test at $5 quote couldn't compete for queue
+    # position against the dominant maker at the 2-bps minimum spread. We
+    # waited 15+ min and received zero fills. Leaving the deposit script
+    # (tools/deposit_vault.py) and config wiring in place for future
+    # experiments with larger size or a different market.
+    enabled: false
+    paper_mode: true
+    market: WETH:USDso
     quote_mode: top_of_book
     improve_ticks: 0
     target_base_value_usd: 5.00
