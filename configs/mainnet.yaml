@@ -46,16 +46,19 @@ unattended:
 
 strategies:
   volume_mill:
-    # Re-enabled after the live yield_maker test failed to get filled at $5
-    # quotes — we couldn't beat the dominant maker's queue position at the
-    # 2-bps minimum spread. IOC on the same book is the proven volume path.
+    # Org request 2026-06-09: pull USDC.e/USDso out, route volume to other
+    # pairs. Shifting to WETH + WBTC — both quote in USDso, both at 2 bps
+    # spread, WBTC has near-zero competing flow (we own the book) and WETH
+    # has the most active taker depth.
     enabled: true
     markets:
-      - USDC.e:USDso
+      - WETH:USDso
+      - WBTC:USDso
     cycle_interval_sec: 10.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      USDC.e:USDso: "65.00"
+      WETH:USDso: "25.00"
+      WBTC:USDso: "35.00"
     max_inventory_imbalance_usd: 80.00
     # Phase 2 survival mode: only cycle when the book is at its 2-bps floor.
     # Skipping the 7-bps tail saves real burn we can't afford over 1 week.
