@@ -150,16 +150,32 @@ class YieldMaker(TradingStrategy):
                 self._last_requote_ts = time.time()
             return []
 
-        # Bid
+        # Bid: always attempt — quote balance acts as bid collateral.
         signals.extend(self._manage_quote(
             current=self._our_bid, target_price=bid_price, target_qty=bid_qty,
             side=Side.BUY, mid=ms.mid,
         ))
-        # Ask
-        signals.extend(self._manage_quote(
-            current=self._our_ask, target_price=ask_price, target_qty=ask_qty,
-            side=Side.SELL, mid=ms.mid,
-        ))
+        # Ask: only when we actually hold base inventory to back the resting
+        # order. Without this check, the engine's simulate-before-broadcast
+        # reverts with "ERC20: transfer amount exceeds balance" and increments
+        # failed_tx_streak — paper mode hid this because _paper_manage_quote
+        # already clamps to available balance.
+        available_base = self._inventory_base_balance(inv)
+        if available_base >= MARKETS[self.market].min_quantity:
+            sell_qty_lot = round_to_lot(
+                min(ask_qty, available_base), self.market, direction="down",
+            )
+            sell_qty = ensure_min_quantity(sell_qty_lot, self.market)
+            if sell_qty is not None and sell_qty > 0:
+                signals.extend(self._manage_quote(
+                    current=self._our_ask, target_price=ask_price, target_qty=sell_qty,
+                    side=Side.SELL, mid=ms.mid,
+                ))
+        elif self._our_ask is not None:
+            # Inventory drained (last ask filled, or none deposited) — drop
+            # the stale tracking so we don't emit a cancel for a never-placed
+            # order, which would 400 with the API expecting a numeric ID.
+            self._our_ask = None
 
         if signals:
             self._last_requote_ts = time.time()
