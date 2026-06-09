@@ -45,12 +45,12 @@ strategies:
     enabled: true
     markets:
       - USDC.e:USDso
-      - WETH:USDso
+      - WBTC:USDso
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       USDC.e:USDso: "45.00"
-      WETH:USDso: "25.00"
+      WBTC:USDso: "35.00"
     max_inventory_imbalance_usd: 60.00
     # Phase 2 Layer 3 (stable): captures USDC.e's bimodal 7-bps tail.
     # Live sample showed 27% of cycles skipping at the 5 bps cap.
