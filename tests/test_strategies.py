@@ -620,3 +620,104 @@ class TestYieldMaker:
         places = [s for s in signals if s.action == SignalAction.PLACE]
         assert len(cancels) > 0, "Expected cancel signals on price drift"
         assert len(places) > 0, "Expected new place signals after cancel"
+
+
+# ════════════════════════════════════════════════════════════════════
+# YieldMaker flatten valve
+# ════════════════════════════════════════════════════════════════════
+
+class TestYieldMakerFlattenValve:
+    """Pre-emptive taker flatten: shed excess base before the sticky
+    inventory_drift pause strands resting quotes on the book."""
+
+    def _strat(self, **overrides):
+        cfg = {
+            "paper_mode": False,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "20.00",
+            "target_base_value_usd": "20.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+            "flatten_above_usd": "30.00",
+            "flatten_cross_bps": "2.0",
+        }
+        cfg.update(overrides)
+        return YieldMaker(cfg)
+
+    @pytest.mark.asyncio
+    async def test_flatten_fires_above_threshold(self):
+        strat = self._strat()
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        # 0.02 WETH ≈ $39.6 > $30 threshold
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="10", base="0.02")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert len(signals) == 1
+        order = signals[0].order
+        assert order is not None
+        assert order.side == Side.SELL
+        assert order.order_type == OrderType.IOC
+        assert order.funding == FundingSource.WALLET
+        assert order.client_order_id.startswith("ym_flat_")
+        # Sheds the excess above target (~$19.6 / bid), not the whole stack
+        assert Decimal("0.009") <= order.quantity <= Decimal("0.011")
+        # Crosses the bid to guarantee the fill
+        assert order.price is not None and order.price < Decimal("1979.14")
+
+    @pytest.mark.asyncio
+    async def test_flatten_cancels_resting_bid_first(self):
+        strat = self._strat()
+        strat._our_bid = {"coid": "ym_buy_test1234", "price": Decimal("1979.15"),
+                          "qty": Decimal("0.01"), "placed_at": time.time()}
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="10", base="0.02")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert len(signals) == 2
+        assert signals[0].action == SignalAction.CANCEL
+        assert signals[0].cancel is not None
+        assert signals[0].cancel.order_id == "ym_buy_test1234"
+        assert strat._our_bid is None
+        assert signals[1].order is not None
+        assert signals[1].order.client_order_id.startswith("ym_flat_")
+
+    @pytest.mark.asyncio
+    async def test_no_flatten_below_threshold(self):
+        strat = self._strat()
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        # 0.0126 WETH ≈ $25 < $30 threshold → normal quoting
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="25", base="0.0126")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert all(
+            s.order is None or not s.order.client_order_id.startswith("ym_flat_")
+            for s in signals
+        )
+        # Both maker quotes placed
+        assert strat._our_bid is not None
+        assert strat._our_ask is not None
+
+    @pytest.mark.asyncio
+    async def test_flatten_disabled_by_default(self):
+        strat = self._strat(flatten_above_usd="0")
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="10", base="0.02")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        assert all(
+            s.order is None or not s.order.client_order_id.startswith("ym_flat_")
+            for s in signals
+        )

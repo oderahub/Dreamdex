@@ -46,11 +46,13 @@ unattended:
 
 strategies:
   volume_mill:
-    # Org request 2026-06-09: pull USDC.e/USDso out, route volume to other
-    # pairs. Shifting to WETH + WBTC — both quote in USDso, both at 2 bps
-    # spread, WBTC has near-zero competing flow (we own the book) and WETH
-    # has the most active taker depth.
-    enabled: true
+    # Disabled 2026-06-10 — taker ping-pong has a hard lifetime-volume
+    # ceiling of 2·capital/spread ≈ $490K on the remaining ~$49 at the
+    # 2 bps floor, which cannot reach milestone 3. It would also self-match
+    # against our own yield_maker quotes on WETH (cancelTaker STP silently
+    # drops the IOC), producing zero volume there. Capital now backs the
+    # maker quotes instead.
+    enabled: false
     markets:
       - WETH:USDso
       - WBTC:USDso
@@ -74,37 +76,65 @@ strategies:
       SOMI:USDso: "10.00"
 
   yield_maker:
-    # Disabled — the live USDC.e test at $5 quote couldn't compete for queue
-    # position against the dominant maker at the 2-bps minimum spread. We
-    # waited 15+ min and received zero fills. Leaving the deposit script
-    # (tools/deposit_vault.py) and config wiring in place for future
-    # experiments with larger size or a different market.
-    enabled: false
-    paper_mode: true
+    # Re-enabled 2026-06-10 after a 30-min read-only flow measurement
+    # (tools/measure_maker_flow.py → logs/maker-flow-measure-30m.jsonl):
+    #   WETH:USDso  205 trades (6.8/min), $16.5K/hour two-sided taker flow,
+    #               median gap 7.4s, median spread 2.07 bps
+    #   WBTC/SOMI   1 trade each in 30 min — dead, do not quote there
+    # Projected capture for a $20 quote with 1-tick improvement: ~$10K/hour
+    # of maker fill volume at zero spread cost (fills EARN ~half-spread).
+    # The two documented live-test failure causes are now addressed:
+    #   - book_reconcile (top-level block) fixes silent WS staleness
+    #     (Phase 2 Finding 1: quotes sat 5 bps off BBO, zero fills)
+    #   - improve_ticks: 1 fixes the queue-position loss (Finding 6) —
+    #     price priority over the dominant maker costs 0.06 bps on WETH.
+    enabled: true
+    paper_mode: false
     market: WETH:USDso
     quote_mode: top_of_book
-    improve_ticks: 0
-    target_base_value_usd: 5.00
-    quote_size_usd: 5.00
-    min_book_spread_bps: 1.50
+    improve_ticks: 1
+    target_base_value_usd: 20.00
+    quote_size_usd: 20.00
+    min_book_spread_bps: 0.5
     min_side_depth_usd: 100.00
     min_half_spread_bps: 1
+    # Flatten valve: shed excess WETH via taker IOC at $30, safely below the
+    # inventory_drift pause cap at $35 (the pause is sticky and strands
+    # resting quotes — prevention is the only unattended-safe option).
+    # Cost: ~2 bps on the excess slice above target, pennies per event.
+    flatten_above_usd: 30.00
+    flatten_cross_bps: 2.0
     gamma: 0.5
     k_vol: 2.0
     requote_threshold_bps: 1.0
-    requote_min_interval_sec: 5.0
+    requote_min_interval_sec: 3.0
     vol_window: 60
     native_base_reserve_by_market:
       SOMI:USDso: "10.00"
+
+# Phase 2 Finding 1 mitigation: the WS orderbook channel goes silently
+# stale per-symbol (documented twice: USDC.e Phase 1, USDC.e again 2026-06-09
+# during the live maker test — quotes sat 5 bps off the real BBO with zero
+# fills). The engine polls REST and replaces the in-memory book whenever the
+# BBO disagrees by more than max_drift_bps. Without this, maker quoting
+# silently produces nothing; do not disable while yield_maker is enabled.
+book_reconcile:
+  enabled: true
+  interval_sec: 4.0
+  max_drift_bps: 1.5
 
 risk:
   realized_loss:
     max_loss_usd: 90.00          # Phase 2: burn capital for volume milestones
   inventory_drift:
-    enabled: false
-    market: SOMI:USDso
-    max_drift_usd: 8.00
-    target_base_usd: 12.50
+    # Police the WETH maker: pause it if WETH holdings leave [0, 35] USD.
+    # Startup is base=0 (drift 17.50 < 17.51, inside bounds); inventory
+    # builds passively via bid fills. Runaway one-sided accumulation
+    # beyond ~$35 pauses the strategy instead of growing exposure.
+    enabled: true
+    market: WETH:USDso
+    max_drift_usd: 17.51
+    target_base_usd: 17.50
     strategy: yield_maker
     native_base_reserve_by_market:
       SOMI:USDso: "10.00"

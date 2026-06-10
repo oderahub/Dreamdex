@@ -243,6 +243,7 @@ async def main(config_path: str | None) -> None:
         approval_config=cfg.get("wallet_approvals", {}),
         unattended_config=cfg.get("unattended", {}),
         reporter=reporter,
+        book_reconcile_config=cfg.get("book_reconcile", {}),
     )
     await engine.initialize()
     engine.register_ws_handlers()

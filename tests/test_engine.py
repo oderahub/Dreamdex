@@ -992,3 +992,89 @@ class TestUnattendedSafeguards:
 
         assert engine._safe_exit_requested is True
         assert engine._safe_exit_reason == "max_submitted_orders_reached"
+
+
+class TestRestBookReconcile:
+    """Phase 2 Finding 1 mitigation: REST poll replaces a stale WS book."""
+
+    def _state(self, engine, bid: str, ask: str):
+        book = {
+            "bids": [{"price": bid, "quantity": "1"}],
+            "asks": [{"price": ask, "quantity": "1"}],
+        }
+        return engine._book_to_state(MarketSymbol.SOMI_USDSO, book)
+
+    def test_drift_zero_when_books_agree(self, fake_components):
+        engine, *_ = fake_components
+        ws_state = self._state(engine, "0.1000", "0.1002")
+        rest_state = self._state(engine, "0.1000", "0.1002")
+        assert engine._bbo_drift_bps(ws_state, rest_state) == Decimal("0")
+
+    def test_drift_detects_stale_bbo(self, fake_components):
+        engine, *_ = fake_components
+        # WS book 5 bps below the real BBO — the documented staleness case.
+        ws_state = self._state(engine, "0.09995", "0.10015")
+        rest_state = self._state(engine, "0.1000", "0.1002")
+        drift = engine._bbo_drift_bps(ws_state, rest_state)
+        assert drift is not None and drift > Decimal("4")
+
+    def test_drift_none_when_ws_side_missing(self, fake_components):
+        engine, *_ = fake_components
+        rest_state = self._state(engine, "0.1000", "0.1002")
+        assert engine._bbo_drift_bps(None, rest_state) is None
+
+    @pytest.mark.asyncio
+    async def test_reconcile_replaces_stale_book(self, fake_components):
+        engine, signer, rest, ws, risk = fake_components
+        market = MarketSymbol.SOMI_USDSO
+        stale = {
+            "bids": [{"price": "0.09995", "quantity": "1"}],
+            "asks": [{"price": "0.10015", "quantity": "1"}],
+        }
+        fresh = {
+            "bids": [{"price": "0.1000", "quantity": "1"}],
+            "asks": [{"price": "0.1002", "quantity": "1"}],
+        }
+        engine._books[market] = stale
+        engine.market_state[market] = engine._book_to_state(market, stale)
+        rest.get_orderbook = AsyncMock(return_value=fresh)
+        engine._reconcile_interval_sec = 0.01
+
+        import asyncio as _asyncio
+        task = _asyncio.create_task(engine._rest_book_reconcile_loop())
+        await _asyncio.sleep(0.05)
+        engine._stopped = True
+        task.cancel()
+        try:
+            await task
+        except _asyncio.CancelledError:
+            pass
+
+        assert engine.market_state[market].best_bid == Decimal("0.1000")
+        assert engine.market_state[market].best_ask == Decimal("0.1002")
+        assert engine._tick_event.is_set()
+
+
+class TestPauseCancelsRestingOrders:
+    """A sticky PAUSE_STRATEGY must not strand resting quotes on the book."""
+
+    @pytest.mark.asyncio
+    async def test_pause_strategy_cancels_open_orders(self, fake_components):
+        engine, signer, rest, ws, risk = fake_components
+        engine.open_orders = {"order-7": {
+            "orderId": "order-7", "market": "SOMI:USDso", "side": "buy",
+            "price": "0.5", "remainingQuantity": "10",
+        }}
+        ev = RiskEvent(
+            rule_name="inventory_drift", action=RiskAction.PAUSE_STRATEGY,
+            severity=Severity.HIGH, reason="drift cap", metadata={},
+            strategy="yield_maker",
+        )
+        await engine._handle_risk_events([ev])
+        assert "yield_maker" in engine.paused_strategies
+        rest.prepare_cancel.assert_awaited_once_with("SOMI:USDso", "order-7")
+
+        # Re-firing the same event while already paused must not re-cancel.
+        rest.prepare_cancel.reset_mock()
+        await engine._handle_risk_events([ev])
+        assert rest.prepare_cancel.await_count == 0

@@ -62,6 +62,12 @@ class YieldMaker(TradingStrategy):
         self.native_base_reserve = Decimal(str(
             reserve_by_market.get(self.market.value, config.get("native_base_reserve", "0"))
         ))
+        # Flatten valve: taker-sell excess base back to target BEFORE the
+        # inventory_drift risk rule fires. The rule's pause is sticky and
+        # leaves resting quotes stranded on the book, so prevention is the
+        # only unattended-safe option. 0 disables the valve.
+        self.flatten_above_usd = Decimal(str(config.get("flatten_above_usd", "0")))
+        self.flatten_cross_bps = Decimal(str(config.get("flatten_cross_bps", "2.0")))
 
         # Quote tracking: set when we emit PLACE, cleared on fill/reject/cancel.
         # Each is None when no resting order is known, otherwise:
@@ -99,6 +105,13 @@ class YieldMaker(TradingStrategy):
             or ms.ask_depth_usd < self.min_side_depth_usd
         ):
             return []
+
+        # Flatten valve — checked before the requote-interval gate because
+        # shedding runaway inventory is urgent, quoting is not.
+        if not self.paper_mode and self.flatten_above_usd > 0:
+            base_value_usd = self._inventory_base_balance(inv) * ms.mid
+            if base_value_usd > self.flatten_above_usd:
+                return self._flatten_signals(ms, inv, base_value_usd)
 
         # Reservation price
         sigma = self._realized_vol()
@@ -312,6 +325,67 @@ class YieldMaker(TradingStrategy):
         place = self._place(side, qty_checked, target_price)
         self._record_placement(side, place.order)
         return [cancel, place]
+
+    def _flatten_signals(
+        self,
+        ms: MarketState,
+        inv: OwnInventory,
+        base_value_usd: Decimal,
+    ) -> list[TradingSignal]:
+        assert ms.best_bid is not None and ms.mid is not None
+        signals: list[TradingSignal] = []
+
+        # The resting bid would keep refilling the inventory we're shedding.
+        if self._our_bid is not None:
+            signals.append(TradingSignal(
+                action=SignalAction.CANCEL,
+                cancel=CancelIntent(
+                    market=self.market,
+                    order_id=self._our_bid["coid"],
+                    reason="yield_maker flatten: stop accumulating",
+                ),
+            ))
+            self._our_bid = None
+
+        base_balance = self._inventory_base_balance(inv)
+        excess_usd = base_value_usd - self.target_base_value_usd
+        qty = excess_usd / ms.best_bid
+        # Don't walk the book: shed at most half the displayed bid depth per
+        # cycle; the valve re-fires next tick if inventory is still high.
+        depth_qty = ms.bid_depth_usd * Decimal("0.5") / ms.best_bid
+        qty = min(qty, depth_qty, base_balance)
+        qty = round_to_lot(qty, self.market, direction="down")
+        qty_checked = ensure_min_quantity(qty, self.market)
+        if qty_checked is None or qty_checked <= 0:
+            return signals
+
+        price = round_to_tick(
+            ms.best_bid * (Decimal("1") - self.flatten_cross_bps / Decimal("10000")),
+            self.market, direction="down",
+        )
+        log.warning(
+            "yield_maker.flatten",
+            market=self.market.value,
+            base_value_usd=str(base_value_usd),
+            flatten_above_usd=str(self.flatten_above_usd),
+            target_base_value_usd=str(self.target_base_value_usd),
+            qty=str(qty_checked),
+            price=str(price),
+        )
+        signals.append(TradingSignal(
+            action=SignalAction.PLACE,
+            order=OrderIntent(
+                market=self.market,
+                side=Side.SELL,
+                order_type=OrderType.IOC,
+                quantity=qty_checked,
+                price=price,
+                funding=FundingSource.WALLET,
+                client_order_id=f"ym_flat_{uuid.uuid4().hex[:8]}",
+                reason="yield_maker flatten excess inventory",
+            ),
+        ))
+        return signals
 
     def _place(self, side: Side, qty: Decimal, price: Decimal) -> TradingSignal:
         coid = f"ym_{side.value}_{uuid.uuid4().hex[:8]}"

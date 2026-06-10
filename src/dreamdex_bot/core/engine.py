@@ -16,6 +16,7 @@ This rewrite fixes the gaps the local audit flagged:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from decimal import Decimal
 from typing import Any
@@ -55,6 +56,7 @@ class Engine:
         approval_config: dict[str, Any] | None = None,
         unattended_config: dict[str, Any] | None = None,
         reporter: EvidenceLog | None = None,
+        book_reconcile_config: dict[str, Any] | None = None,
     ) -> None:
         self.settings = settings
         self.signer = signer
@@ -85,6 +87,16 @@ class Engine:
         self._last_balance_refresh_ts: float = 0.0
         self._balance_refresh_min_interval_sec: float = float(
             (unattended_config or {}).get("balance_refresh_min_interval_sec", 5.0)
+        )
+        # Phase 2 Finding 1 mitigation: the WS orderbook channel can go
+        # silently stale per-symbol while other symbols keep streaming, so the
+        # global ws_staleness risk rule never trips. Poll REST and replace the
+        # in-memory book when the two disagree at the BBO.
+        reconcile_cfg = book_reconcile_config or {}
+        self._reconcile_enabled: bool = bool(reconcile_cfg.get("enabled", True))
+        self._reconcile_interval_sec: float = float(reconcile_cfg.get("interval_sec", 4.0))
+        self._reconcile_max_drift_bps: Decimal = Decimal(
+            str(reconcile_cfg.get("max_drift_bps", "1.5"))
         )
         self._submitted_approvals: dict[tuple[str, str], Decimal] = {}
         self._started_ts = time.time()
@@ -652,22 +664,90 @@ class Engine:
         )
 
     # ────────────────────────────────────────────────────────────────
+    # REST book reconciliation (Phase 2 Finding 1 mitigation)
+    # ────────────────────────────────────────────────────────────────
+
+    def _bbo_drift_bps(
+        self, ws_state: MarketState | None, rest_state: MarketState,
+    ) -> Decimal | None:
+        """Worst-case BBO disagreement between WS and REST views, in bps of
+        the REST mid. None means the WS view is missing a side REST has —
+        treat that as unconditionally stale."""
+        if rest_state.mid is None or rest_state.mid <= 0:
+            return Decimal("0")  # REST book empty/one-sided: nothing to compare
+        if (
+            ws_state is None
+            or ws_state.best_bid is None or ws_state.best_ask is None
+            or rest_state.best_bid is None or rest_state.best_ask is None
+        ):
+            return None
+        bid_drift = abs(ws_state.best_bid - rest_state.best_bid)
+        ask_drift = abs(ws_state.best_ask - rest_state.best_ask)
+        return max(bid_drift, ask_drift) / rest_state.mid * Decimal("10000")
+
+    async def _rest_book_reconcile_loop(self) -> None:
+        while not self._stopped:
+            for m in self.markets_to_watch:
+                if self._stopped:
+                    return
+                try:
+                    book = await self.rest.get_orderbook(m.value, depth=20)
+                except Exception as e:
+                    log.warning("engine.book_reconcile_fetch_failed",
+                                market=m.value, error=str(e))
+                    continue
+                rest_state = self._book_to_state(m, book)
+                drift = self._bbo_drift_bps(self.market_state.get(m), rest_state)
+                if drift is not None and drift <= self._reconcile_max_drift_bps:
+                    continue
+                self._books[m] = {
+                    "bids": book.get("bids", []), "asks": book.get("asks", []),
+                }
+                self.market_state[m] = rest_state
+                log.warning(
+                    "engine.ws_book_stale_replaced",
+                    market=m.value,
+                    drift_bps=str(drift) if drift is not None else "ws_side_missing",
+                    max_drift_bps=str(self._reconcile_max_drift_bps),
+                )
+                self._report(
+                    event="ws_book_stale_replaced",
+                    category="market_data",
+                    market=m.value,
+                    drift_bps=str(drift) if drift is not None else "ws_side_missing",
+                )
+                self._tick_event.set()
+            await asyncio.sleep(self._reconcile_interval_sec)
+
+    # ────────────────────────────────────────────────────────────────
     # Main tick loop
     # ────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         log.info("engine.starting")
-        while not self._stopped:
-            try:
-                await asyncio.wait_for(self._tick_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
-            self._tick_event.clear()
-            try:
-                self._check_unattended_limits()
-                await self._tick()
-            except Exception as e:
-                log.error("engine.tick_failed", error=str(e))
+        reconcile_task: asyncio.Task[None] | None = None
+        if self._reconcile_enabled:
+            reconcile_task = asyncio.create_task(self._rest_book_reconcile_loop())
+            log.info("engine.book_reconcile_started",
+                     interval_sec=self._reconcile_interval_sec,
+                     max_drift_bps=str(self._reconcile_max_drift_bps))
+        try:
+            while not self._stopped:
+                try:
+                    await asyncio.wait_for(self._tick_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self._tick_event.clear()
+                try:
+                    self._check_unattended_limits()
+                    await self._tick()
+                except Exception as e:
+                    log.error("engine.tick_failed", error=str(e))
+        finally:
+            if reconcile_task is not None:
+                reconcile_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reconcile_task
 
     async def _tick(self) -> None:
         # Reset tick-scoped soft pauses; persistent pauses (paused_all from
@@ -984,7 +1064,18 @@ class Engine:
                     self.paused_all = True
             elif ev.action == RiskAction.PAUSE_STRATEGY:
                 if ev.strategy:
+                    newly_paused = ev.strategy not in self.paused_strategies
                     self.paused_strategies.add(ev.strategy)
+                    # A paused strategy can no longer manage its resting
+                    # quotes, and the pause is sticky until restart. Leaving
+                    # quotes on the book means unmanaged fills at stale
+                    # prices, so cancel everything once on pause entry.
+                    if newly_paused and self.open_orders:
+                        log.warning(
+                            "engine.pause_cancels_resting_orders",
+                            strategy=ev.strategy, count=len(self.open_orders),
+                        )
+                        await self._cancel_all_orders()
                 else:
                     # Unscoped pause → escalate to pause-all
                     self.paused_all = True
