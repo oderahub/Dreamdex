@@ -721,3 +721,67 @@ class TestYieldMakerFlattenValve:
             s.order is None or not s.order.client_order_id.startswith("ym_flat_")
             for s in signals
         )
+
+
+class TestYieldMakerBidFreeQuoteGate:
+    """Bids must size to free quote — POST_ONLY collateral is pulled from
+    the wallet at placement, so full-size quoting during a cancel-refund
+    window double-locks capital."""
+
+    def _strat(self):
+        return YieldMaker({
+            "paper_mode": False,
+            "market": "WETH:USDso",
+            "quote_mode": "top_of_book",
+            "quote_size_usd": "20.00",
+            "improve_ticks": 1,
+            "requote_min_interval_sec": 0,
+        })
+
+    @pytest.mark.asyncio
+    async def test_bid_skipped_when_quote_insufficient(self):
+        strat = self._strat()
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="9.14", base="0")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        # $9.14 × 0.95 / 1979 ≈ 0.0043 < min_quantity 0.001? No — it IS
+        # above lot, but below the $20 target it gets capped to affordable
+        # size. The key assertion: any bid placed must fit free quote.
+        for s in signals:
+            if s.order is not None and s.order.side == Side.BUY:
+                assert s.order.quantity * s.order.price <= Decimal("9.14")
+
+    @pytest.mark.asyncio
+    async def test_bid_capped_to_affordable_size(self):
+        strat = self._strat()
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="25", base="0")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        bids = [s for s in signals if s.order is not None and s.order.side == Side.BUY]
+        assert len(bids) == 1
+        notional = bids[0].order.quantity * bids[0].order.price
+        # Target $20 fits within 25 × 0.95 free quote — full size quoted.
+        assert Decimal("19") <= notional <= Decimal("20.5")
+
+    @pytest.mark.asyncio
+    async def test_zero_quote_places_no_bid(self):
+        strat = self._strat()
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="0.5", base="0")
+
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+
+        bids = [s for s in signals if s.order is not None and s.order.side == Side.BUY]
+        # 0.5 × 0.95 / 1979 ≈ 0.00024 — below WETH min_quantity 0.001
+        assert bids == []
+        assert strat._our_bid is None

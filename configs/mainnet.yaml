@@ -3,7 +3,12 @@
 # bump aggressiveness once we've confirmed mainnet behavior matches testnet.
 
 bot:
-  starting_capital_usd: 100.00
+  # Drawdown baseline. Set to actual remaining session capital (~$49 wallet
+  # + locked collateral as of 2026-06-10), not the original 100 — half was
+  # burned by the taker mill before the maker pivot, and measuring drawdown
+  # against money that's already gone makes the max_drawdown rule a hair
+  # trigger (it kill-switched on a phantom -90% during a requote window).
+  starting_capital_usd: 50.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso

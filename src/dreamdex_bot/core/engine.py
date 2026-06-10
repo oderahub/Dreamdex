@@ -915,6 +915,30 @@ class Engine:
                 state.wallet_quote,
             )
         total_value += sum(wallet_quote_by_token.values(), Decimal(0))
+        # Collateral locked in resting orders is pulled into the pool
+        # contract at placement and is invisible to wallet AND vault balance
+        # reads. Count it, or a requote window (new bid placed before the
+        # old bid's cancel refund lands) reads as a capital loss — observed
+        # live 2026-06-10 as a phantom -90% drawdown that tripped the kill
+        # switch while all funds were safely locked in two resting bids.
+        for order in self.open_orders.values():
+            try:
+                market = MarketSymbol(str(order.get("market") or order.get("symbol", "")))
+            except ValueError:
+                continue
+            remaining = Decimal(str(
+                order.get("remainingQuantity", order.get("quantity", "0")) or "0"
+            ))
+            if remaining <= 0:
+                continue
+            side = str(order.get("side", "")).lower()
+            if side == "buy":
+                price = Decimal(str(order.get("price", "0") or "0"))
+                total_value += remaining * price
+            elif side == "sell":
+                mark = self.market_state.get(market)
+                if mark is not None and mark.mid:
+                    total_value += remaining * mark.mid
         realized = sum((inv.realized_pnl_usd for inv in inv_view.values()), Decimal(0))
         unrealized = sum((inv.unrealized_pnl_usd for inv in inv_view.values()), Decimal(0))
         drawdown = ((total_value - self.starting_capital_usd) / self.starting_capital_usd * 100
@@ -1182,6 +1206,9 @@ class Engine:
                     side=order.side.value,
                     client_order_id=order.client_order_id,
                 )
+                await self._notify_reject(
+                    strategy_name, order.client_order_id, "order_simulation_rejected",
+                )
                 return None
             if order_id:
                 simulated_order_id = str(order_id)
@@ -1198,6 +1225,9 @@ class Engine:
                 side=order.side.value,
                 client_order_id=order.client_order_id,
                 error=str(e),
+            )
+            await self._notify_reject(
+                strategy_name, order.client_order_id, "order_simulation_failed",
             )
             return None
 
@@ -1552,8 +1582,28 @@ class Engine:
             )
             return fallback
 
+    async def _notify_reject(self, strategy_name: str, coid: str, reason: str) -> None:
+        """Tell the owning strategy its order never reached the book, so it
+        clears quote tracking instead of later trying to cancel a phantom."""
+        for strat in self.strategies:
+            if strat.name == strategy_name:
+                try:
+                    await strat.on_reject(coid, reason)
+                except Exception as e:
+                    log.error("engine.on_reject_hook_failed",
+                              strategy=strategy_name, error=str(e))
+                return
+
     async def _cancel_order(self, cancel: Any) -> None:
         order_id = self.client_order_to_order_id.get(cancel.order_id, cancel.order_id)
+        if not str(order_id).isdigit():
+            # A coid that never resolved to an exchange id means the order
+            # never reached the book (simulation failure or reject race).
+            # The cancel endpoint only accepts numeric ids — a DELETE here
+            # 400s and bumps failed_tx_streak for a nonexistent order.
+            log.warning("engine.cancel_skipped_unresolved_id",
+                        requested_id=str(cancel.order_id))
+            return
         prep = await self.rest.prepare_cancel(cancel.market.value, order_id)
         tx_hash = await self.signer.send_tx(
             to=prep["to"], data=prep["data"],

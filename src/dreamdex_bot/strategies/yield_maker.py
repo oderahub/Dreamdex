@@ -163,11 +163,28 @@ class YieldMaker(TradingStrategy):
                 self._last_requote_ts = time.time()
             return []
 
-        # Bid: always attempt — quote balance acts as bid collateral.
-        signals.extend(self._manage_quote(
-            current=self._our_bid, target_price=bid_price, target_qty=bid_qty,
-            side=Side.BUY, mid=ms.mid,
-        ))
+        # Bid: size to free quote. POST_ONLY collateral is pulled from the
+        # wallet at placement (Phase 2 Finding 2), so quoting full size while
+        # a cancel refund is in flight double-locks collateral and drains the
+        # wallet — observed live 2026-06-10: the third bid in a requote burst
+        # simulation-reverted with have=$9.14 want=$20.
+        free_quote = max(
+            Decimal("0"), inv.quote_balance - inv.quote_locked_in_orders,
+        )
+        affordable_qty = round_to_lot(
+            free_quote * Decimal("0.95") / bid_price, self.market, direction="down",
+        )
+        bid_qty_capped = min(bid_qty, affordable_qty)
+        if bid_qty_capped > 0:
+            signals.extend(self._manage_quote(
+                current=self._our_bid, target_price=bid_price, target_qty=bid_qty_capped,
+                side=Side.BUY, mid=ms.mid,
+            ))
+        elif self._our_bid is None:
+            log.info(
+                "yield_maker.bid_skipped_insufficient_quote",
+                market=self.market.value, free_quote=str(free_quote),
+            )
         # Ask: only when we actually hold base inventory to back the resting
         # order. Without this check, the engine's simulate-before-broadcast
         # reverts with "ERC20: transfer amount exceeds balance" and increments

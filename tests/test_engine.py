@@ -215,7 +215,7 @@ class TestCancelIdResolution:
     @pytest.mark.asyncio
     async def test_cancel_uses_server_order_id_when_mapping_exists(self, fake_components):
         engine, signer, rest, _, _ = fake_components
-        engine.client_order_to_order_id["client-1"] = "server-1"
+        engine.client_order_to_order_id["client-1"] = "184467440737101"
 
         await engine._cancel_order(CancelIntent(
             market=MarketSymbol.SOMI_USDSO,
@@ -223,7 +223,7 @@ class TestCancelIdResolution:
             reason="requote",
         ))
 
-        rest.prepare_cancel.assert_awaited_once_with("SOMI:USDso", "server-1")
+        rest.prepare_cancel.assert_awaited_once_with("SOMI:USDso", "184467440737101")
         signer.send_tx.assert_awaited_once()
 
 
@@ -1078,3 +1078,74 @@ class TestPauseCancelsRestingOrders:
         rest.prepare_cancel.reset_mock()
         await engine._handle_risk_events([ev])
         assert rest.prepare_cancel.await_count == 0
+
+
+class TestEquityCountsLockedCollateral:
+    """Order-locked collateral is invisible to wallet/vault reads; equity
+    must add it back or requote windows read as phantom drawdowns."""
+
+    def test_open_buy_order_collateral_counts(self, fake_components):
+        engine, *_ = fake_components
+        engine.open_orders = {"order-1": {
+            "orderId": "order-1", "market": "SOMI:USDso", "side": "buy",
+            "price": "0.5", "remainingQuantity": "40",
+        }}
+        metrics = engine._compute_metrics({})
+        assert metrics.total_value_usd == Decimal("20")
+
+    def test_open_sell_order_marks_at_mid(self, fake_components):
+        engine, *_ = fake_components
+        market = MarketSymbol.SOMI_USDSO
+        book = {
+            "bids": [{"price": "0.4998", "quantity": "100"}],
+            "asks": [{"price": "0.5002", "quantity": "100"}],
+        }
+        engine.market_state[market] = engine._book_to_state(market, book)
+        engine.open_orders = {"order-2": {
+            "orderId": "order-2", "market": "SOMI:USDso", "side": "sell",
+            "price": "0.5002", "remainingQuantity": "40",
+        }}
+        metrics = engine._compute_metrics({})
+        assert metrics.total_value_usd == Decimal("20")  # 40 × mid 0.5
+
+
+class TestCancelUnresolvedIdGuard:
+    """A cancel whose coid never resolved to a numeric exchange id must be
+    dropped, not DELETEd (the API 400s on non-numeric ids)."""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_coid_cancel_is_skipped(self, fake_components):
+        engine, signer, rest, *_ = fake_components
+        cancel = CancelIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            order_id="ym_buy_phantom1", reason="requote",
+        )
+        await engine._cancel_order(cancel)
+        rest.prepare_cancel.assert_not_awaited()
+        signer.send_tx.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolved_coid_cancel_proceeds(self, fake_components):
+        engine, signer, rest, *_ = fake_components
+        engine.client_order_to_order_id["ym_buy_real1234"] = "147573952589684098111"
+        cancel = CancelIntent(
+            market=MarketSymbol.SOMI_USDSO,
+            order_id="ym_buy_real1234", reason="requote",
+        )
+        await engine._cancel_order(cancel)
+        rest.prepare_cancel.assert_awaited_once_with(
+            "SOMI:USDso", "147573952589684098111")
+
+
+class TestNotifyRejectDispatch:
+    """Simulation failures must clear the owning strategy's quote tracking."""
+
+    @pytest.mark.asyncio
+    async def test_notify_reject_reaches_named_strategy(self, fake_components):
+        engine, *_ = fake_components
+        strat = MagicMock()
+        strat.name = "yield_maker"
+        strat.on_reject = AsyncMock()
+        engine.strategies = [strat]
+        await engine._notify_reject("yield_maker", "ym_buy_abc12345", "order_simulation_failed")
+        strat.on_reject.assert_awaited_once_with("ym_buy_abc12345", "order_simulation_failed")
