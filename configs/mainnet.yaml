@@ -98,11 +98,16 @@ strategies:
     min_book_spread_bps: 0.5
     min_side_depth_usd: 100.00
     min_half_spread_bps: 1
-    # Flatten valve: shed excess WETH via taker IOC at $30, safely below the
-    # inventory_drift pause cap at $35 (the pause is sticky and strands
-    # resting quotes — prevention is the only unattended-safe option).
+    # Flatten valve: shed excess WETH via taker IOC back to target.
+    # INVARIANT (learned 2026-06-10, first live hour): inventory moves in
+    # quote_size ($20) jumps, so thresholds must respect the quantum —
+    #   valve in (target, target + quote_size]   → fires on the FIRST fill
+    #   pause cap > target + 2 × quote_size      → only a failed valve trips it
+    # The first deploy had valve 30 / cap 35 with $20 jumps: a second bid
+    # fill went $20 → $40 over both lines at once and the sticky pause
+    # bricked the strategy (risk evaluates before strategies each tick).
     # Cost: ~2 bps on the excess slice above target, pennies per event.
-    flatten_above_usd: 30.00
+    flatten_above_usd: 25.00
     flatten_cross_bps: 2.0
     gamma: 0.5
     k_vol: 2.0
@@ -127,14 +132,16 @@ risk:
   realized_loss:
     max_loss_usd: 90.00          # Phase 2: burn capital for volume milestones
   inventory_drift:
-    # Police the WETH maker: pause it if WETH holdings leave [0, 35] USD.
-    # Startup is base=0 (drift 17.50 < 17.51, inside bounds); inventory
-    # builds passively via bid fills. Runaway one-sided accumulation
-    # beyond ~$35 pauses the strategy instead of growing exposure.
+    # Police the WETH maker: pause it if WETH holdings leave [-0.5, 60.5] USD.
+    # The cap MUST clear target + 2 × quote_size (20 + 40 = 60): inventory
+    # moves in $20 fill-quanta and the flatten valve (fires at $25, sells
+    # back to $20) needs room to act before this sticky pause does. The
+    # pause now only fires if the valve failed twice in a row — and when it
+    # fires, the engine cancels all resting orders (pause-cancel fix).
     enabled: true
     market: WETH:USDso
-    max_drift_usd: 17.51
-    target_base_usd: 17.50
+    max_drift_usd: 30.50
+    target_base_usd: 30.00
     strategy: yield_maker
     native_base_reserve_by_market:
       SOMI:USDso: "10.00"
