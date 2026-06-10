@@ -51,13 +51,13 @@ unattended:
 
 strategies:
   volume_mill:
-    # Disabled 2026-06-10 — taker ping-pong has a hard lifetime-volume
-    # ceiling of 2·capital/spread ≈ $490K on the remaining ~$49 at the
-    # 2 bps floor, which cannot reach milestone 3. It would also self-match
-    # against our own yield_maker quotes on WETH (cancelTaker STP silently
-    # drops the IOC), producing zero volume there. Capital now backs the
-    # maker quotes instead.
-    enabled: false
+    # Re-enabled 2026-06-10 evening. The maker captured only ~$300 of volume
+    # in 12h (dominant maker wins the fills) — far below the 2·capital/spread
+    # ceiling. Volume is the goal and milestones pay at the end, so the mill's
+    # reliable ~$19.8K/h converts the remaining ~$49 into ~490K of volume,
+    # banking the 500K milestone. yield_maker is off, so no self-match (STP)
+    # concern — the mill owns WETH+WBTC alone.
+    enabled: true
     markets:
       - WETH:USDso
       - WBTC:USDso
@@ -81,19 +81,12 @@ strategies:
       SOMI:USDso: "10.00"
 
   yield_maker:
-    # Re-enabled 2026-06-10 after a 30-min read-only flow measurement
-    # (tools/measure_maker_flow.py → logs/maker-flow-measure-30m.jsonl):
-    #   WETH:USDso  205 trades (6.8/min), $16.5K/hour two-sided taker flow,
-    #               median gap 7.4s, median spread 2.07 bps
-    #   WBTC/SOMI   1 trade each in 30 min — dead, do not quote there
-    # Projected capture for a $20 quote with 1-tick improvement: ~$10K/hour
-    # of maker fill volume at zero spread cost (fills EARN ~half-spread).
-    # The two documented live-test failure causes are now addressed:
-    #   - book_reconcile (top-level block) fixes silent WS staleness
-    #     (Phase 2 Finding 1: quotes sat 5 bps off BBO, zero fills)
-    #   - improve_ticks: 1 fixes the queue-position loss (Finding 6) —
-    #     price priority over the dominant maker costs 0.06 bps on WETH.
-    enabled: true
+    # Disabled 2026-06-10 evening. Live result over 12h / 4 deploys: ~$300
+    # of captured volume — the dominant maker won nearly every fill, so the
+    # $7.7K/h available flow never translated. Switched to the mill for
+    # reliable volume. Config (improve_ticks:1, flatten valve, $20 quotes)
+    # left intact for a future attempt with more capital / a quieter pair.
+    enabled: false
     paper_mode: false
     market: WETH:USDso
     quote_mode: top_of_book

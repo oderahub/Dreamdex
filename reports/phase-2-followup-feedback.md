@@ -389,6 +389,14 @@ from tx simulation or the per-order WS channel — a client that misses
 both (e.g. restart between placement and ack) must re-list open orders
 to rediscover its own order.
 
+**Update (same day, later session).** Order age does not explain the
+pattern: order `239807672958231966995` (a resting PostOnly ask placed
+~12:00 UTC) also rejected a cancel at ~70 minutes of age —
+`0xab52522be8eac061a7fcbcf949fa9234a4750294f0ecc28c3adcc40d7f823264`,
+status=0 — while a different order of similar age cancelled fine the
+same hour. Whatever gates cancellation, it is per-order state, not a
+settlement window.
+
 **Suggested fix.** Document the conditions under which cancel reverts
 (is there a minimum age / settlement window after placement?), publish
 the revert selectors (Finding 5), consider making cancel idempotent
