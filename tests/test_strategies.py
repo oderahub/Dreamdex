@@ -785,3 +785,24 @@ class TestYieldMakerBidFreeQuoteGate:
         # 0.5 × 0.95 / 1979 ≈ 0.00024 — below WETH min_quantity 0.001
         assert bids == []
         assert strat._our_bid is None
+
+
+class TestVolumeMillPerMarketSpreadGate:
+    """SOMI lives at a 9-19bp spread floor; WETH/WBTC at ~2bp. The spread
+    gate must be configurable per market or SOMI never cycles."""
+
+    def test_by_market_override_applies(self):
+        strat = VolumeMill({
+            "market": "SOMI:USDso",
+            "max_spread_bps": 3.0,
+            "max_spread_bps_by_market": {"SOMI:USDso": 12.0},
+        })
+        assert strat.max_spread_bps == Decimal("12.0")
+
+    def test_fallback_to_global_gate(self):
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "max_spread_bps": 3.0,
+            "max_spread_bps_by_market": {"SOMI:USDso": 12.0},
+        })
+        assert strat.max_spread_bps == Decimal("3.0")

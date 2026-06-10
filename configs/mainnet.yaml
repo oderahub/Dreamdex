@@ -63,14 +63,24 @@ strategies:
     markets:
       - WETH:USDso
       - WBTC:USDso
+      - SOMI:USDso
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
       WBTC:USDso: "45.00"
+      # SOMI added per org/user request 2026-06-10. Kept SMALL on purpose:
+      # its 9.5-19bp spread costs 5-10x more per volume dollar than the 2bp
+      # pairs, so a full-balance cycle there would torch the milestone-2
+      # budget. $6 cycles make SOMI volume visible at ~$0.006/cycle burn.
+      SOMI:USDso: "6.00"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
+    # SOMI's floor is ~9.5bp; gate at 12 so it cycles in the tighter half of
+    # its range and skips the 15-19bp moments.
+    max_spread_bps_by_market:
+      SOMI:USDso: 12.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
     ioc_cross_bps: 2.0

@@ -48,7 +48,14 @@ class VolumeMill(TradingStrategy):
         self.max_inventory_imbalance_usd = Decimal(
             str(config.get("max_inventory_imbalance_usd", "0"))
         )
-        self.max_spread_bps = Decimal(str(config.get("max_spread_bps", "100")))
+        # Per-market spread gate: pairs live at very different spread floors
+        # (WETH/WBTC pinned at ~2bp, SOMI at 9-19bp). A single global gate
+        # either silently skips the wide pair forever or lets the tight pairs
+        # cycle through expensive spread flickers.
+        spread_by_market = config.get("max_spread_bps_by_market", {})
+        self.max_spread_bps = Decimal(str(
+            spread_by_market.get(self.market.value, config.get("max_spread_bps", "100"))
+        ))
         self.min_side_depth_usd = Decimal(str(config.get("min_side_depth_usd", "1.00")))
         self.depth_usage_fraction = Decimal(str(config.get("depth_usage_fraction", "0.50")))
         self.ioc_cross_bps = Decimal(str(config.get("ioc_cross_bps", "5.0")))
