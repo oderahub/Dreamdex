@@ -279,6 +279,175 @@ short-term lift and worth highlighting in any future bot-author guide.
 
 ---
 
+## Finding 8 — Collateral locked in resting orders is invisible to every balance read
+
+**What we observed.** When a PostOnly order is placed, its collateral
+leaves the wallet (Finding 2) — but it does not appear in the
+`/v0/markets/{symbol}/vault/balance` response either. While an order
+rests, the collateral exists only inside the pool contract, with no API
+surface that reports it.
+
+Timeline from 2026-06-10 (all from our structured logs):
+
+```text
+06:59:24  wallet USDso 49.10   (no open orders)
+06:59:27  PostOnly bid placed  (~$19.90 notional)
+06:59:28  wallet USDso 29.20   vault_quote 0.000
+```
+
+With two bids resting earlier the same morning, the wallet read 9.14
+while ~$40 sat in order locks — visible nowhere.
+
+**Why this is hard for bot authors.** Any equity or drawdown
+calculation built from wallet + vault reads silently loses the locked
+amount. In our case a routine requote (new bid placed before the old
+bid's cancel refund landed) made account equity appear to collapse from
+$49 to $9 — a phantom −90% drawdown that tripped our kill switch and
+halted the bot, with all funds in fact safe. The only workaround is to
+reconstruct locked value client-side from open-order remaining × price,
+which depends on the open-orders listing being reliable (see Finding 11).
+
+**Suggested fix.** Expose locked collateral per market (or
+account-wide) — e.g. a `lockedInOrders` field on the vault balance
+response — or document the full collateral custody lifecycle in
+`trading/vaults.md`: wallet → pool lock (placement) → consumed (fill) or
+wallet refund (cancel), including the latency of the refund leg.
+
+---
+
+## Finding 9 — WS orderbook snapshot ~15 bps stale at subscription time (Finding 1, third instance)
+
+**What we observed.** After this morning's incidents we added an
+automated REST-vs-WS reconciler to the bot (REST poll every 4s, replace
+the in-memory book at >1.5 bps BBO drift). On its very first pass —
+0.2–0.3 seconds after `ws.connected` — it caught two symbols whose WS
+snapshots disagreed with REST by 15 bps:
+
+```text
+06:59:25.465  ws.connected
+06:59:25.658  ws_book_stale_replaced  market=USDC.e:USDso  drift_bps=15.0000
+06:59:25.770  ws_book_stale_replaced  market=WBTC:USDso    drift_bps=15.0061
+```
+
+This is a different flavor from Finding 1: not a live stream going
+quiet, but the *initial snapshot* delivered on subscription already
+being stale. The suspiciously round 15.0000 bps on the stablecoin pair
+suggests a cached snapshot rather than a fresh book read.
+
+**Why this matters.** A maker that prices its first quotes off the
+subscription snapshot quotes 15 bps off market the moment it boots —
+post-only orders either reject (would-cross) or rest uselessly deep.
+This compounds Finding 1: bot authors now have to distrust both the
+stream *and* the snapshot.
+
+**Suggested fix.** Serve the subscription snapshot from the same source
+as `/v0/orderbooks`, or document the expected snapshot freshness so
+clients know to reconcile against REST at startup.
+
+---
+
+## Finding 10 — Order cancellation can revert deterministically, with no way to diagnose or even detect it from the API surface
+
+**What we observed.** During an automated shutdown on 2026-06-10 we
+cancelled two freshly placed resting bids. All four cancel transactions
+(two per order, including retries) **reverted on-chain** while the REST
+prepare endpoint happily returned signable transactions every time:
+
+```text
+order 147573952589684098111 (bid, placed 06:36:45)
+  cancel @ 06:36:50  status=0  gasUsed=197,341
+  cancel @ 06:36:59  status=0  gasUsed=197,341   (identical revert point)
+  cancel @ 07:54:12  status=1  gasUsed=199,832   (succeeds, 78 min later)
+
+order 184467440737103201374 (bid, placed 06:36:51)
+  cancel @ 06:36:54  status=0  gasUsed=30,484
+  cancel @ 06:37:00  status=0  gasUsed=30,484    (early revert, different mode)
+```
+
+The first order rejected two cancel attempts at T+5s and T+14s after
+placement — reverting ~2,500 gas short of the successful run's total,
+i.e. at the very end of the cancel flow — then cancelled cleanly with
+the same calldata pattern 78 minutes later. Its ~$20 of collateral
+stayed locked (and invisible, Finding 8) the whole time.
+
+**Why this is hard for bot authors.** Three independent gaps compound:
+
+1. The prepare endpoint performs no validation — it returns a signable
+   cancel tx for any order id, so the client learns about failure only
+   from the receipt.
+2. The revert reasons are undocumented custom selectors (Finding 5),
+   so we cannot tell *why* a cancel of a genuinely open, later-cancellable
+   order reverts.
+3. A cancel-and-replace loop that does not await receipts (the natural
+   high-throughput pattern) silently accumulates zombie resting orders
+   with locked collateral.
+
+Additionally, recovery is awkward: the cancel path only accepts the
+numeric uint128 id (`DELETE /orders/ym_buy_93b536f2` → 400
+`invalid_param`, pattern `^[0-9]+$`), and that id is only obtainable
+from tx simulation or the per-order WS channel — a client that misses
+both (e.g. restart between placement and ack) must re-list open orders
+to rediscover its own order.
+
+**Suggested fix.** Document the conditions under which cancel reverts
+(is there a minimum age / settlement window after placement?), publish
+the revert selectors (Finding 5), consider making cancel idempotent
+(no-op success on already-cancelled), and accept `clientOrderId` as a
+cancel key.
+
+---
+
+## Finding 11 — Open-orders listing inconsistent with on-chain order state
+
+**What we observed.** Order `147573952589684098111` (Finding 10) was
+never successfully cancelled before 07:54 — both earlier cancel txs
+reverted on-chain. Yet the REST open-orders listing disagreed with
+itself across the same window:
+
+```text
+06:59:25  GET /orders?status=open (4 markets)  → engine.initialized open_orders=0
+07:54:0x  GET /orders?status=open (WETH)       → 2 orders, including 147573952589684098111
+07:54:12  cancel of 147573952589684098111      → status=1 (it was live on-chain all along)
+```
+
+A live, cancellable order was absent from the listing at 06:59 and
+present at 07:54, with no successful state-changing transaction for
+that order in between (receipts above).
+
+**Why this matters.** The open-orders listing is the recovery path of
+last resort (Finding 10) and the only client-side source for
+reconstructing locked collateral (Finding 8). If it can omit a live
+order, a bot that reconciles state after restart will undercount its
+locked funds and may double-commit collateral.
+
+**Suggested fix.** Document the consistency model of
+`/orders?status=open` (indexer lag? eventual consistency window?) and,
+if possible, expose an as-of block number in the response so clients
+can reason about staleness.
+
+---
+
+## Finding 5 addendum — second undocumented error selector
+
+Order placement simulation on 2026-06-10 06:36:55 reverted with
+selector `0xe450d38c` and three ABI-encoded words that decode cleanly
+as `(address wallet, uint256 have, uint256 want)`:
+
+```text
+selector:  0xe450d38c
+wallet:    0x4258950186a12492bf805f2b9d7facd202921f34
+have:      0x7ecd734e8031e000   ≈  9.136 USDso
+want:      0x1156b7a71c0e1e000  ≈ 19.992 USDso
+```
+
+The values matched our wallet state exactly (insufficient free quote
+for a bid's collateral). This is the second selector we have had to
+reverse-engineer (after `0xcf479181`, Finding 3/5) — both turned out to
+be benign insufficient-balance variants, but each cost a debugging
+session that a published selector table would have avoided.
+
+---
+
 ## Summary of suggested doc additions
 
 In priority order, by what a new cohort would benefit from most:
@@ -291,14 +460,27 @@ In priority order, by what a new cohort would benefit from most:
    debugging session for any maker-bot author.
 4. **Yield payout cadence** (Finding 4) — decision-blocking for
    competition contexts.
-5. **Custom error selector list** (Finding 5) — accelerates revert
-   debugging.
+5. **Custom error selector list** (Finding 5 + addendum) — accelerates
+   revert debugging; we have now reverse-engineered two selectors.
 6. **Maker BBO competitiveness disclaimer** (Finding 6) — calibrates
    participant expectations.
+7. **Locked-collateral visibility** (Finding 8) — without it, every
+   equity calculation a bot author writes is wrong while orders rest.
+8. **Cancel revert conditions + idempotent cancel** (Finding 10) — the
+   only finding in this report where funds were temporarily
+   inaccessible with no API-visible explanation.
+9. **Open-orders consistency model** (Finding 11) — the recovery path
+   for Findings 8 and 10 must itself be reliable.
+10. **WS snapshot freshness** (Finding 9) — extends the Finding 1
+    heartbeat ask to the subscription snapshot.
 
 None of these are protocol-breaking. They are all places where the
 protocol behaves correctly but the behavior is either undocumented or
 surfaced through error paths a bot author has to reverse-engineer.
+Findings 8–11 compound each other in practice: invisible collateral
+(8) must be reconstructed from a listing that can omit live orders
+(11), after cancels that can silently revert (10), with error
+selectors nobody can decode (5).
 
 ---
 
@@ -325,4 +507,26 @@ Vault withdraw revert (custom error decoded in Finding 3)
   selector:      0xcf479181
   have:          0x000e35fa931a0000  =  0.004 USDso
   want:          0x8ac7230489e80000  = 10.000 USDso
+
+Cancel reverts on freshly placed orders (Finding 10, all status=0 on-chain)
+  order_a:       147573952589684098111
+  place_a:       0xc9d17149749cd7c4631701eeb2bac104692aadaafa3fd5ca9106d9116d2b147b
+  cancel_a_1:    0xd9b33dadd35c9ffc269f78af2d103972edb98f4ae7eae6839c7ee430f9f943d8  gasUsed=197341
+  cancel_a_2:    0x6ca9ea1a54b5f1e5a57c539671e581a10d2807ed8bebb3ad052cfdbbb918bc94  gasUsed=197341
+  cancel_a_ok:   0x999d4a9f778ee55be3352fdb3071d2531d3c5aff7feb0dc0021e2449c0de8f4e  status=1 gasUsed=199832
+  order_b:       184467440737103201374
+  place_b:       0xaeb6c4cb7be24df534ed1be80cb1c4a5d01a12e91dce6f423e727d7963a314f1
+  cancel_b_1:    0x4ce007d19557b47ca969dc1b523688174e42b53a14a60dcad14eb36a2f2974ad  gasUsed=30484
+  cancel_b_2:    0x9d7f5ac74d0746044e0af05977f83936317e29741a60caeabb06eb5673472bd5  gasUsed=30484
+
+Insufficient-collateral placement revert (Finding 5 addendum)
+  selector:      0xe450d38c
+  wallet:        0x4258950186a12492bf805f2b9d7facd202921f34
+  have:          0x7ecd734e8031e000   ≈  9.136 USDso
+  want:          0x1156b7a71c0e1e000  ≈ 19.992 USDso
+
+WS snapshot staleness at subscribe (Finding 9, from structured logs)
+  06:59:25.465   ws.connected
+  06:59:25.658   ws_book_stale_replaced  USDC.e:USDso  drift_bps=15.0000
+  06:59:25.770   ws_book_stale_replaced  WBTC:USDso    drift_bps=15.0061
 ```

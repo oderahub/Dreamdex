@@ -126,3 +126,10 @@ class TradingStrategy(ABC):
     async def on_reject(self, order_id: str, reason: str) -> None:
         """Optional hook: called when one of this strategy's orders is rejected."""
         return None
+
+    def tracked_client_order_ids(self) -> set[str]:
+        """Client order ids the strategy currently believes are resting on the
+        book. The engine uses this to detect orders that vanished without a
+        WS event (missed fill/cancel) and notify the strategy via on_reject.
+        Strategies that hold no resting state return an empty set."""
+        return set()

@@ -477,3 +477,11 @@ class YieldMaker(TradingStrategy):
         if self._our_ask and self._our_ask.get("coid") in (order_id, reason):
             self._our_ask = None
         log.warning("yield_maker.rejected", order_id=order_id, reason=reason)
+
+    def tracked_client_order_ids(self) -> set[str]:
+        coids = set()
+        if self._our_bid:
+            coids.add(self._our_bid["coid"])
+        if self._our_ask:
+            coids.add(self._our_ask["coid"])
+        return coids

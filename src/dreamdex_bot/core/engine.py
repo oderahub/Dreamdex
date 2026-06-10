@@ -98,6 +98,25 @@ class Engine:
         self._reconcile_max_drift_bps: Decimal = Decimal(
             str(reconcile_cfg.get("max_drift_bps", "1.5"))
         )
+        # Idle state reconciliation: balances refresh only after our own txs
+        # and order tracking only updates from per-order WS events. If the bot
+        # misses a fill/cancel event while idle, the strategy keeps believing
+        # it has resting quotes and never requotes — silently stuck (observed
+        # 2026-06-10: 4+ hours of book-poll-only with 0 open orders on-chain).
+        # When no tx has happened for idle_after_sec, re-read balances + open
+        # orders from REST and tell strategies which tracked orders vanished.
+        self._idle_reconcile_after_sec: float = float(
+            reconcile_cfg.get("idle_after_sec", 45.0)
+        )
+        self._last_idle_reconcile_ts: float = 0.0
+        # Finding 11: the open-orders listing can transiently omit a live
+        # order. Require an order to be missing on N consecutive polls before
+        # telling the strategy to drop it, so a flaky listing can't trick us
+        # into double-quoting. coid -> consecutive-miss count.
+        self._order_miss_counts: dict[str, int] = {}
+        self._idle_reconcile_miss_threshold: int = int(
+            reconcile_cfg.get("idle_miss_threshold", 2)
+        )
         self._submitted_approvals: dict[tuple[str, str], Decimal] = {}
         self._started_ts = time.time()
         self._submitted_order_count = 0
@@ -717,7 +736,63 @@ class Engine:
                     drift_bps=str(drift) if drift is not None else "ws_side_missing",
                 )
                 self._tick_event.set()
+            await self._maybe_idle_reconcile()
             await asyncio.sleep(self._reconcile_interval_sec)
+
+    async def _maybe_idle_reconcile(self) -> None:
+        """When the bot has been idle (no tx) for a while, re-read balances and
+        open orders from REST and clear strategy quote-tracking for orders that
+        have vanished. This is the recovery path for a missed fill/cancel WS
+        event, which otherwise leaves a strategy believing it is quoting when
+        it holds nothing on the book."""
+        if self._idle_reconcile_after_sec <= 0:
+            return
+        now = time.time()
+        idle_for = now - self.last_successful_tx_ts
+        if idle_for < self._idle_reconcile_after_sec:
+            return
+        if now - self._last_idle_reconcile_ts < self._idle_reconcile_after_sec:
+            return
+        self._last_idle_reconcile_ts = now
+
+        try:
+            await self._refresh_balances()
+            await self._refresh_open_orders()
+        except Exception as e:
+            log.warning("engine.idle_reconcile_failed", error=str(e))
+            return
+
+        live_coids = set(self.client_order_to_order_id.keys())
+        # Drop miss-counts for orders that came back so a recovered listing
+        # resets the confirmation counter.
+        for coid in list(self._order_miss_counts.keys()):
+            if coid in live_coids:
+                del self._order_miss_counts[coid]
+
+        cleared = 0
+        for strat in self.strategies:
+            for coid in strat.tracked_client_order_ids():
+                if coid in live_coids:
+                    continue
+                # Finding 11: confirm the order is missing on consecutive
+                # polls before acting, so a transient listing gap doesn't
+                # clear a genuinely-resting quote.
+                self._order_miss_counts[coid] = self._order_miss_counts.get(coid, 0) + 1
+                if self._order_miss_counts[coid] < self._idle_reconcile_miss_threshold:
+                    continue
+                self._order_miss_counts.pop(coid, None)
+                await self._notify_reject(strat.name, coid, "idle_reconcile_vanished")
+                cleared += 1
+
+        if cleared:
+            log.warning("engine.idle_reconcile_cleared_stale_quotes",
+                        idle_for_sec=f"{idle_for:.0f}", cleared=cleared)
+            self._report(
+                event="idle_reconcile_cleared_stale_quotes",
+                category="market_data",
+                cleared=cleared,
+            )
+            self._tick_event.set()
 
     # ────────────────────────────────────────────────────────────────
     # Main tick loop

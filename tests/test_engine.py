@@ -1149,3 +1149,68 @@ class TestNotifyRejectDispatch:
         engine.strategies = [strat]
         await engine._notify_reject("yield_maker", "ym_buy_abc12345", "order_simulation_failed")
         strat.on_reject.assert_awaited_once_with("ym_buy_abc12345", "order_simulation_failed")
+
+
+class TestIdleReconcile:
+    """Idle reconciliation clears strategy quote-tracking for orders that
+    vanished without a WS event — the recovery path for a missed fill/cancel
+    that otherwise leaves the strategy believing it is quoting nothing."""
+
+    def _strat_tracking(self, *coids):
+        strat = MagicMock()
+        strat.name = "yield_maker"
+        strat.tracked_client_order_ids = MagicMock(return_value=set(coids))
+        strat.on_reject = AsyncMock()
+        return strat
+
+    @pytest.mark.asyncio
+    async def test_no_reconcile_when_recently_active(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        engine._idle_reconcile_after_sec = 45.0
+        engine.last_successful_tx_ts = __import__("time").time()  # just traded
+        await engine._maybe_idle_reconcile()
+        rest.get_my_orders.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vanished_order_cleared_after_threshold(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        engine._idle_reconcile_after_sec = 45.0
+        engine._idle_reconcile_miss_threshold = 2
+        engine.last_successful_tx_ts = 0.0  # long idle
+        strat = self._strat_tracking("ym_buy_ghost01")
+        engine.strategies = [strat]
+        rest.get_my_orders = AsyncMock(return_value=[])  # exchange shows nothing
+
+        # First idle pass: missing once — below threshold, not cleared yet.
+        await engine._maybe_idle_reconcile()
+        strat.on_reject.assert_not_awaited()
+        assert engine._order_miss_counts.get("ym_buy_ghost01") == 1
+
+        # Force the cadence gate open and run again: second miss → cleared.
+        engine._last_idle_reconcile_ts = 0.0
+        await engine._maybe_idle_reconcile()
+        strat.on_reject.assert_awaited_once_with("ym_buy_ghost01", "idle_reconcile_vanished")
+
+    @pytest.mark.asyncio
+    async def test_recovered_order_resets_miss_count(self, fake_components):
+        engine, _, rest, _, _ = fake_components
+        engine._idle_reconcile_after_sec = 45.0
+        engine._idle_reconcile_miss_threshold = 2
+        engine.last_successful_tx_ts = 0.0
+        strat = self._strat_tracking("ym_buy_real01")
+        engine.strategies = [strat]
+        rest.get_my_orders = AsyncMock(return_value=[])
+
+        await engine._maybe_idle_reconcile()
+        assert engine._order_miss_counts.get("ym_buy_real01") == 1
+
+        # Listing recovers (Finding 11 transient gap): order is back.
+        engine._last_idle_reconcile_ts = 0.0
+        rest.get_my_orders = AsyncMock(return_value=[{
+            "orderId": "111", "clientOrderId": "ym_buy_real01",
+            "market": "SOMI:USDso", "side": "buy", "price": "0.5",
+            "remainingQuantity": "10",
+        }])
+        await engine._maybe_idle_reconcile()
+        strat.on_reject.assert_not_awaited()
+        assert "ym_buy_real01" not in engine._order_miss_counts

@@ -132,6 +132,15 @@ book_reconcile:
   enabled: true
   interval_sec: 4.0
   max_drift_bps: 1.5
+  # Idle state reconciliation: if no tx has fired for idle_after_sec, re-read
+  # balances + open orders and clear strategy quote-tracking for orders that
+  # vanished (missed fill/cancel WS event). Without this the maker silently
+  # wedged 3x on 2026-06-10 — believing it was quoting while holding nothing.
+  # idle_miss_threshold: require the order missing on N consecutive polls
+  # before dropping it, so the flaky open-orders listing (Finding 11) can't
+  # clear a genuinely-resting quote.
+  idle_after_sec: 45.0
+  idle_miss_threshold: 2
 
 risk:
   realized_loss:
