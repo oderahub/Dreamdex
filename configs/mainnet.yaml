@@ -51,28 +51,25 @@ unattended:
 
 strategies:
   volume_mill:
-    # 2026-06-10 night: org re-allowed the stablecoin pair. Mill exclusively
-    # on USDC.e:USDso — same ~1bp-per-volume-dollar spread cost as WETH
-    # (the peg does NOT remove the 0.9999/1.0001 spread), but zero
-    # volatility/drift risk, a dense book parked at the peg ($1.5-2K within
-    # 3 levels), and the milestone-1 mill run measured 0.97bp realized burn.
-    # With ~$45.51 remaining this projects ~455-550K more volume; final
-    # total ~0.95-1.05M, so milestone 2 hinges on realized efficiency —
-    # minimizing variance is the whole game.
+    # CORRECTION 2026-06-10 night: the stablecoin-pair ban was NOT lifted —
+    # the earlier USDC.e config was a misread of the org's message. Back to
+    # WETH+WBTC, the allowed pairs with the tightest spreads (~2.0-2.1bp,
+    # 0.97bp realized burn measured on the milestone-1 run). SOMI:USDso was
+    # evaluated and rejected: 9.5-19bp spread makes it ~5-10x more expensive
+    # per volume dollar — it would cap the remaining $45 at ~50-95K volume.
+    # 5s cycles + full-balance sizing (95%-of-free clamp shares the balance
+    # across the two markets, effectively alternating full cycles).
     enabled: true
     markets:
-      - USDC.e:USDso
-    # 5s cycles (Phase 2 confirmed ~3s/tx settle cadence) doubles throughput
-    # vs 10s; the full burn completes in ~7h instead of ~14h.
+      - WETH:USDso
+      - WBTC:USDso
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      # Full balance per cycle; the strategy clamps to 95% of free quote,
-      # so sizes track the balance down as the spread burn consumes it.
-      USDC.e:USDso: "45.00"
+      WETH:USDso: "45.00"
+      WBTC:USDso: "45.00"
     max_inventory_imbalance_usd: 80.00
-    # The peg book sits at exactly 2bp (0.9999/1.0001). Gate at 3bp so a
-    # transiently one-sided book pauses cycling instead of paying extra.
+    # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
