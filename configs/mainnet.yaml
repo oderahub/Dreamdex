@@ -51,24 +51,28 @@ unattended:
 
 strategies:
   volume_mill:
-    # Re-enabled 2026-06-10 evening. The maker captured only ~$300 of volume
-    # in 12h (dominant maker wins the fills) — far below the 2·capital/spread
-    # ceiling. Volume is the goal and milestones pay at the end, so the mill's
-    # reliable ~$19.8K/h converts the remaining ~$49 into ~490K of volume,
-    # banking the 500K milestone. yield_maker is off, so no self-match (STP)
-    # concern — the mill owns WETH+WBTC alone.
+    # 2026-06-10 night: org re-allowed the stablecoin pair. Mill exclusively
+    # on USDC.e:USDso — same ~1bp-per-volume-dollar spread cost as WETH
+    # (the peg does NOT remove the 0.9999/1.0001 spread), but zero
+    # volatility/drift risk, a dense book parked at the peg ($1.5-2K within
+    # 3 levels), and the milestone-1 mill run measured 0.97bp realized burn.
+    # With ~$45.51 remaining this projects ~455-550K more volume; final
+    # total ~0.95-1.05M, so milestone 2 hinges on realized efficiency —
+    # minimizing variance is the whole game.
     enabled: true
     markets:
-      - WETH:USDso
-      - WBTC:USDso
-    cycle_interval_sec: 10.0
+      - USDC.e:USDso
+    # 5s cycles (Phase 2 confirmed ~3s/tx settle cadence) doubles throughput
+    # vs 10s; the full burn completes in ~7h instead of ~14h.
+    cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
-      WETH:USDso: "25.00"
-      WBTC:USDso: "35.00"
+      # Full balance per cycle; the strategy clamps to 95% of free quote,
+      # so sizes track the balance down as the spread burn consumes it.
+      USDC.e:USDso: "45.00"
     max_inventory_imbalance_usd: 80.00
-    # Phase 2 survival mode: only cycle when the book is at its 2-bps floor.
-    # Skipping the 7-bps tail saves real burn we can't afford over 1 week.
+    # The peg book sits at exactly 2bp (0.9999/1.0001). Gate at 3bp so a
+    # transiently one-sided book pauses cycling instead of paying extra.
     max_spread_bps: 3.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
