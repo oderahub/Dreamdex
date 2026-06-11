@@ -60,23 +60,28 @@ strategies:
     # 5s cycles + full-balance sizing (95%-of-free clamp shares the balance
     # across the two markets, effectively alternating full cycles).
     enabled: true
-    # SOMI:USDso removed 2026-06-11 after ~7h in rotation, triple-condemned
-    # by live data: (1) 9.5-19bp spread = 5-10x burn per volume dollar,
-    # (2) its sell leg skips on thin bids (sell_qty_too_small_after_depth_cap)
-    # while buys keep firing — a ratchet that parked ~60 SOMI (~$6.4) of
-    # trading capital as what looked like gas, (3) blended burn rose from
-    # 0.97bp to ~1.45bp. Pure WETH+WBTC maximizes the 1M long shot.
+    # SOMI:USDso re-added 2026-06-11 morning (user request) after the gas
+    # exhaustion stall (native_somi_below_floor at 04:55). Known trade-offs
+    # from the first rotation: ~1.45bp blended burn (vs 0.97bp without) and
+    # a sell-skip ratchet that accumulates SOMI — which is now a FEATURE:
+    # leftover SOMI is native gas, so SOMI cycles keep the tank topped up
+    # and the mill becomes gas-self-sustaining. Bounded at $6/cycle, 12bp
+    # gate so it can't dominate the burn.
     markets:
       - WETH:USDso
       - WBTC:USDso
+      - SOMI:USDso
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
       WBTC:USDso: "45.00"
+      SOMI:USDso: "6.00"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
+    max_spread_bps_by_market:
+      SOMI:USDso: 12.0
     min_side_depth_usd: 100.00
     depth_usage_fraction: 0.50
     ioc_cross_bps: 2.0
