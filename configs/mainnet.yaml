@@ -8,7 +8,12 @@ bot:
   # burned by the taker mill before the maker pivot, and measuring drawdown
   # against money that's already gone makes the max_drawdown rule a hair
   # trigger (it kill-switched on a phantom -90% during a requote window).
-  starting_capital_usd: 50.00
+  # Lowered 2026-06-12: the max_drawdown rule (80%) against the old $50
+  # baseline ordered the bot to retire at $10 equity — which it did, with
+  # $8.93 of usable fuel left and first place 23K away (trader-3 gas-bricked
+  # at 784K with capital stranded in WETH). Baseline 10 → floor $2: burn
+  # everything down to dust, then stop.
+  starting_capital_usd: 10.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
