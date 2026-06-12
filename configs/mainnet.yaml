@@ -46,8 +46,8 @@ unattended:
   # buy to 95% of available balance, so removing this floor doesn't
   # risk negative balances — it just lets every remaining dollar work.
   min_liquid_usdso: "0"
-  max_runtime_sec: 72000
-  max_submitted_orders: 20000
+  max_runtime_sec: 259200
+  max_submitted_orders: 60000
   drawdown_confirmations: 10
   # Phase 2: matches the post-Layer-2 ~3s/tx cadence so the inventory
   # tracker stays fresh and IOC sells don't simulate-fail on stale state.
@@ -72,17 +72,18 @@ strategies:
     # leftover SOMI is native gas, so SOMI cycles keep the tank topped up
     # and the mill becomes gas-self-sustaining. Bounded at $6/cycle, 12bp
     # gate so it can't dominate the burn.
-    # Endgame 2026-06-12: rivals refueled and active; pure WETH measured
-    # 0.92bp (best) and gas is externally refilled, so SOMI's expensive
-    # self-refuel cycles and WBTC's $6.3 min size are dead weight at a
-    # $10 bankroll. Every bp = ~10K of final volume now.
+    # FINAL CONFIG 2026-06-12: org requires SOMI:USDso activity, so it
+    # stays — bounded at $6/cycle behind a 12bp gate so WETH (0.92bp, the
+    # workhorse) carries the volume. WBTC dropped: its $6.3 min size is
+    # dead weight at a $10 bankroll. 4s cycles, runtime/order caps lifted
+    # to outlast the fuel, drawdown floor $2.
     markets:
       - WETH:USDso
-    cycle_interval_sec: 5.0
+      - SOMI:USDso
+    cycle_interval_sec: 4.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
-      WBTC:USDso: "45.00"
       SOMI:USDso: "6.00"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
