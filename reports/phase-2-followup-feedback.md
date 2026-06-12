@@ -3,7 +3,7 @@
 ## Scope
 
 These observations were collected during Phase 2 of the Alpha Trading Competition
-(June 8 – June 9, 2026) while operating an unattended bot against the
+(June 8 – June 11, 2026) while operating an unattended bot against the
 mainnet API at `https://api.dreamdex.io` and the Somnia mainnet RPC.
 
 The bot wallet used:
@@ -70,9 +70,11 @@ streaming.
 per-symbol heartbeat at a documented cadence, or documented
 stale-channel semantics so clients can detect and re-subscribe.
 
-**Bot-side mitigation we plan to add.** A periodic REST orderbook
-comparison against the in-memory WS book, with auto-resubscribe when
-drift > N bps for > M seconds on any subscribed symbol.
+**Bot-side mitigation (since implemented).** A periodic REST orderbook
+comparison against the in-memory WS book that replaces the in-memory
+book on >1.5 bps BBO drift. It went live on 2026-06-10 and caught
+stale state on its first pass after every subsequent reconnect — see
+Finding 9 for what it revealed about subscription snapshots.
 
 ---
 
@@ -317,7 +319,7 @@ wallet refund (cancel), including the latency of the refund leg.
 
 ## Finding 9 — WS orderbook snapshot ~15 bps stale at subscription time (Finding 1, third instance)
 
-**What we observed.** After this morning's incidents we added an
+**What we observed.** After the 2026-06-10 morning incidents we added an
 automated REST-vs-WS reconciler to the bot (REST poll every 4s, replace
 the in-memory book at >1.5 bps BBO drift). On its very first pass —
 0.2–0.3 seconds after `ws.connected` — it caught two symbols whose WS
@@ -394,8 +396,10 @@ pattern: order `239807672958231966995` (a resting PostOnly ask placed
 ~12:00 UTC) also rejected a cancel at ~70 minutes of age —
 `0xab52522be8eac061a7fcbcf949fa9234a4750294f0ecc28c3adcc40d7f823264`,
 status=0 — while a different order of similar age cancelled fine the
-same hour. Whatever gates cancellation, it is per-order state, not a
-settlement window.
+same hour. The same order then cancelled successfully in a later sweep
+that day (`0x7c8ddeb395eff91decfb9e881c1a7e2e5968d7a83b49a8f3b551dd1e1bcf441a`,
+status=1). Whatever gates cancellation, it is per-order state, not a
+settlement window — and it eventually clears on its own.
 
 **Suggested fix.** Document the conditions under which cancel reverts
 (is there a minimum age / settlement window after placement?), publish
@@ -456,6 +460,22 @@ session that a published selector table would have avoided.
 
 ---
 
+## Finding 12 — Vault balance endpoint is not scoped to the authenticated wallet
+
+**What we observed.** `GET /v0/markets/{symbol}/vault/balance` requires
+authentication, but honors an arbitrary `walletAddress` query parameter:
+with our session token we could read the vault balances of any other
+participant's wallet.
+
+**Why we mention it.** The data is public on-chain anyway, so this is
+not a confidentiality issue — but the mismatch between "endpoint
+requires auth" and "auth does not scope the response" is worth a
+deliberate decision. Either drop the auth requirement (it is public
+data) or scope the parameter to the authenticated wallet, so the
+behavior is intentional rather than incidental.
+
+---
+
 ## Summary of suggested doc additions
 
 In priority order, by what a new cohort would benefit from most:
@@ -481,6 +501,8 @@ In priority order, by what a new cohort would benefit from most:
    for Findings 8 and 10 must itself be reliable.
 10. **WS snapshot freshness** (Finding 9) — extends the Finding 1
     heartbeat ask to the subscription snapshot.
+11. **Vault endpoint auth scoping** (Finding 12) — make the
+    auth-vs-public mismatch a deliberate choice.
 
 None of these are protocol-breaking. They are all places where the
 protocol behaves correctly but the behavior is either undocumented or
@@ -526,6 +548,11 @@ Cancel reverts on freshly placed orders (Finding 10, all status=0 on-chain)
   place_b:       0xaeb6c4cb7be24df534ed1be80cb1c4a5d01a12e91dce6f423e727d7963a314f1
   cancel_b_1:    0x4ce007d19557b47ca969dc1b523688174e42b53a14a60dcad14eb36a2f2974ad  gasUsed=30484
   cancel_b_2:    0x9d7f5ac74d0746044e0af05977f83936317e29741a60caeabb06eb5673472bd5  gasUsed=30484
+
+Cancel reverts at ~70 min of order age (Finding 10 update)
+  order_c:       239807672958231966995
+  cancel_c_fail: 0xab52522be8eac061a7fcbcf949fa9234a4750294f0ecc28c3adcc40d7f823264  status=0
+  cancel_c_ok:   0x7c8ddeb395eff91decfb9e881c1a7e2e5968d7a83b49a8f3b551dd1e1bcf441a  status=1
 
 Insufficient-collateral placement revert (Finding 5 addendum)
   selector:      0xe450d38c
