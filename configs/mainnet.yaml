@@ -72,10 +72,12 @@ strategies:
     # leftover SOMI is native gas, so SOMI cycles keep the tank topped up
     # and the mill becomes gas-self-sustaining. Bounded at $6/cycle, 12bp
     # gate so it can't dominate the burn.
+    # Endgame 2026-06-12: rivals refueled and active; pure WETH measured
+    # 0.92bp (best) and gas is externally refilled, so SOMI's expensive
+    # self-refuel cycles and WBTC's $6.3 min size are dead weight at a
+    # $10 bankroll. Every bp = ~10K of final volume now.
     markets:
       - WETH:USDso
-      - WBTC:USDso
-      - SOMI:USDso
     cycle_interval_sec: 5.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
