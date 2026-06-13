@@ -8,12 +8,12 @@ bot:
   # burned by the taker mill before the maker pivot, and measuring drawdown
   # against money that's already gone makes the max_drawdown rule a hair
   # trigger (it kill-switched on a phantom -90% during a requote window).
-  # Lowered 2026-06-12: the max_drawdown rule (80%) against the old $50
-  # baseline ordered the bot to retire at $10 equity — which it did, with
-  # $8.93 of usable fuel left and first place 23K away (trader-3 gas-bricked
-  # at 784K with capital stranded in WETH). Baseline 10 → floor $2: burn
-  # everything down to dust, then stop.
-  starting_capital_usd: 10.00
+  # Lowered again 2026-06-13 to 0.50 (floor $0.10): on the final ~$2 push to
+  # 800K the bot must grind capital all the way to the WETH min-order floor
+  # (~$1.67) without the drawdown rule halting it at $2 equity. With so little
+  # capital, max_drawdown is meaningless anyway — let min-order/gas be the
+  # natural stop.
+  starting_capital_usd: 0.50
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
@@ -77,9 +77,12 @@ strategies:
     # workhorse) carries the volume. WBTC dropped: its $6.3 min size is
     # dead weight at a $10 bankroll. 4s cycles, runtime/order caps lifted
     # to outlast the fuel, drawdown floor $2.
+    # Final push 2026-06-13: WETH only. At a ~$2 bankroll WETH's 2bp spread
+    # is the only gas- and capital-efficient way to add the last ~4K volume
+    # to 800K; SOMI's 18bp would waste both. SOMI stays in the wallet purely
+    # as gas (tank refills tomorrow).
     markets:
       - WETH:USDso
-      - SOMI:USDso
     cycle_interval_sec: 4.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
