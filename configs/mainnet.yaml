@@ -40,7 +40,11 @@ wallet_approvals:
   mode: max
 
 unattended:
-  min_native_somi: "1.00"
+  # Lowered 1.00 -> 0.05 for the final 800K push (2026-06-13): the mill is
+  # wallet-funded IOC with no resting orders, so draining gas toward empty
+  # carries no stuck-state risk — it just stops submitting when too low. The
+  # 0.05 buffer covers ~15 last tx; below that, attempts simply fail harmless.
+  min_native_somi: "0.05"
   # Phase 2 survival mode: drain wallet to ~$1 (min quantity floor)
   # instead of pausing at $1 USDso. The strategy already clamps each
   # buy to 95% of available balance, so removing this floor doesn't
