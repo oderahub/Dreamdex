@@ -15,7 +15,10 @@ bot:
   # the wallet still holds ~$7.30, comfortably above the floor. For the
   # tightest USDso retention, manually suspend Render the moment the
   # leaderboard reads 1,000,000 (locks in ~$7.30 exactly).
-  starting_capital_usd: 25.00
+  # Lowered to 15 (floor $3) 2026-06-14 for the SOMI-self-refuel finish: the
+  # 18bp SOMI cycles burn ~$3 extra, so a $5 floor would halt ~5K short of
+  # 1M. Floor $3 lets it reach 1M and stop with ~$3-4 USDso retained.
+  starting_capital_usd: 15.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
@@ -83,17 +86,21 @@ strategies:
     # workhorse) carries the volume. WBTC dropped: its $6.3 min size is
     # dead weight at a $10 bankroll. 4s cycles, runtime/order caps lifted
     # to outlast the fuel, drawdown floor $2.
-    # Final push 2026-06-13: WETH only. At a ~$2 bankroll WETH's 2bp spread
-    # is the only gas- and capital-efficient way to add the last ~4K volume
-    # to 800K; SOMI's 18bp would waste both. SOMI stays in the wallet purely
-    # as gas (tank refills tomorrow).
+    # Autonomy switch 2026-06-14 (~885K): SOMI:USDso re-added as a gas
+    # self-refuel leg so the run finishes to 1M without further org gas
+    # refills. WETH (2bp) carries the volume; SOMI ($5/cycle, 12bp gate)
+    # buys native SOMI back into the wallet to offset the ~2.2 SOMI/hr burn.
+    # Deploy this ONLY when the tank still holds ~1.5-2 SOMI (bootstrap room);
+    # at <0.4 SOMI the SOMI buys can't be sent. Costs ~$3 extra retention
+    # (18bp SOMI cycles), so 1M lands with ~$3-4 USDso vs ~$7 on org gas.
     markets:
       - WETH:USDso
+      - SOMI:USDso
     cycle_interval_sec: 4.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
-      SOMI:USDso: "6.00"
+      SOMI:USDso: "5.00"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
