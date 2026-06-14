@@ -8,12 +8,14 @@ bot:
   # burned by the taker mill before the maker pivot, and measuring drawdown
   # against money that's already gone makes the max_drawdown rule a hair
   # trigger (it kill-switched on a phantom -90% during a requote window).
-  # Lowered again 2026-06-13 to 0.50 (floor $0.10): on the final ~$2 push to
-  # 800K the bot must grind capital all the way to the WETH min-order floor
-  # (~$1.67) without the drawdown rule halting it at $2 equity. With so little
-  # capital, max_drawdown is meaningless anyway — let min-order/gas be the
-  # natural stop.
-  starting_capital_usd: 0.50
+  # Raised to 25 (floor $5) 2026-06-13 for the 1M-milestone push: after a
+  # +$25 capital injection the wallet holds ~$27.43. Goal is 1M volume
+  # (~$20 of burn) while RETAINING USDso. The $5 drawdown floor is a safety
+  # net so an unattended overnight run can't drain capital to zero — at 1M
+  # the wallet still holds ~$7.30, comfortably above the floor. For the
+  # tightest USDso retention, manually suspend Render the moment the
+  # leaderboard reads 1,000,000 (locks in ~$7.30 exactly).
+  starting_capital_usd: 25.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
